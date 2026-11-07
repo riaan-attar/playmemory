@@ -27,3 +27,6 @@ class VectorMatrix:
             self._vecs = grown
         self._vecs[self._n : need] = vecs
         self._n = need
+
+    def set(self, fid: int, vec: np.ndarray) -> None:
+        self._vecs[fid] = np.asarray(vec, dtype=np.float32)

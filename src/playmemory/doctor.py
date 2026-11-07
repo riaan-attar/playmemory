@@ -21,10 +21,10 @@ import numpy as np
 from . import crypto
 from .store import (
     _CRC, _LEN, _TOMB, FLAG_VEC_F16, REC_ANN, REC_CHECKPOINT, REC_FRAME, REC_FRAME_Z,
-    REC_EVENT, REC_SIGNATURE, REC_TOMBSTONE, FrameStore, read_header, _fsync_dir,
+    REC_EVENT, REC_SIGNATURE, REC_TOMBSTONE, REC_VECTOR, FrameStore, read_header, _fsync_dir,
 )
 
-_KNOWN = (REC_FRAME, REC_TOMBSTONE, REC_CHECKPOINT, REC_ANN, REC_FRAME_Z, REC_SIGNATURE, REC_EVENT)
+_KNOWN = (REC_FRAME, REC_TOMBSTONE, REC_CHECKPOINT, REC_ANN, REC_FRAME_Z, REC_SIGNATURE, REC_EVENT, REC_VECTOR)
 _WINDOW = 1 << 24
 _POINTER_KEYS = ("supersedes", "source")
 
@@ -63,7 +63,7 @@ def _next_valid(data, start: int, size: int) -> int | None:
     while pos < size:
         hi = min(pos + _WINDOW, size)
         types = arr[pos + 4 : hi + 4 if hi + 4 <= size else size]
-        cand = np.flatnonzero((types >= 1) & (types <= 7)) + pos
+        cand = np.flatnonzero((types >= 1) & (types <= 8)) + pos
         for c in cand.tolist():
             if _try(data, c, size) is not None:  # length + type + CRC32 all check out
                 return c
@@ -138,6 +138,7 @@ def _run(path: str, dest: str | None, password=None) -> Report:
         out = FrameStore(dest, h["dim"], h["name"], spec=h["spec"], flags=h["flags"] & ~2,
                          password=password if h["encrypted"] else None, sync="never")
     idmap: dict[int, int] = {}
+    vec_updates: dict[int, np.ndarray] = {}  # enriched embeddings: newest per old frame id
     seen_frames = 0
     max_id = -1
     with open(path, "rb") as f:
@@ -154,7 +155,7 @@ def _run(path: str, dest: str | None, password=None) -> Report:
                 body = bytes(data[a + 4 : b - 4])
                 if h["encrypted"] and cipher is None:
                     continue  # damage map only: payloads cannot be read without the password
-                if cipher is not None and rtype in (REC_FRAME, REC_FRAME_Z, REC_TOMBSTONE):
+                if cipher is not None and rtype in (REC_FRAME, REC_FRAME_Z, REC_TOMBSTONE, REC_VECTOR):
                     body = bytes([rtype]) + cipher.unseal(body[1:], rtype, a)
                 if rtype in (REC_FRAME, REC_FRAME_Z):
                     jl = struct.unpack_from("<I", body, 1)[0]
@@ -182,6 +183,9 @@ def _run(path: str, dest: str | None, password=None) -> Report:
                         idmap[old] = out.append(rec["t"], rec["text"], meta, vec).id
                     else:
                         idmap[old] = old
+                elif rtype == REC_VECTOR:
+                    (old,) = struct.unpack_from("<Q", body, 1)
+                    vec_updates[old] = np.frombuffer(body, vdt, h["dim"], 9).astype(np.float32)
                 elif rtype == REC_TOMBSTONE:
                     old, t = _TOMB.unpack(body[1:])
                     if old in idmap:
@@ -196,6 +200,10 @@ def _run(path: str, dest: str | None, password=None) -> Report:
                     data.close()
                 except BufferError:
                     pass
+    if out is not None:
+        for old, vec in vec_updates.items():
+            if old in idmap:
+                out.set_vector(idmap[old], vec)
     rep.frames_lost_at_least = max(max_id + 1 - rep.frames_salvaged, 0)
     rep.ok = not rep.gaps
     if out is not None:

@@ -23,6 +23,7 @@ FLAG_VEC_F16 = 1  # vectors stored as float16 (half the size), read back as floa
 FLAG_ENCRYPTED = 2  # record payloads are AES-GCM sealed; header carries a KDF block
 REC_SIGNATURE = 6  # HMAC-SHA256 over every byte before this record
 REC_EVENT = 7  # session/audit event (JSON); never affects frame ids
+REC_VECTOR = 8  # later embedding for an existing frame: u64 frame id | vector (progressive enrichment)
 Z_MIN_JSON = 200  # don't bother compressing tiny records
 _HDR = struct.Struct("<4sHHH")  # magic, version, dim, name_len
 _SPEC = struct.Struct("<H")
@@ -188,6 +189,8 @@ class FrameStore:
         self._offsets: list[int] = []
         self._voffs: list[int] = []
         self._event_offs: list[int] = []
+        self._vec_rec: dict[int, int] = {}  # frame id -> offset of its newest REC_VECTOR record
+        self.vec_updated: set[int] = set()  # ids whose vector changed since the caller last looked
         self._times: list[float] = []
         self.metas: list[dict] = []
         self.deleted: dict[int, float] = {}
@@ -387,7 +390,7 @@ class FrameStore:
             if zlib.crc32(body) != crc:
                 break
             rtype = body[0]
-            if self._cipher is not None and rtype in (REC_FRAME, REC_FRAME_Z, REC_TOMBSTONE):
+            if self._cipher is not None and rtype in (REC_FRAME, REC_FRAME_Z, REC_TOMBSTONE, REC_VECTOR):
                 body = bytes([rtype]) + self._plain(rtype, body[1:], pos)
             if rtype in (REC_FRAME, REC_FRAME_Z):
                 try:
@@ -408,6 +411,11 @@ class FrameStore:
                 self.deleted[fid] = t
             elif rtype == REC_EVENT:
                 self._event_offs.append(pos)
+            elif rtype == REC_VECTOR:
+                fid = struct.unpack_from("<Q", body, 1)[0]
+                if fid < len(self._times):
+                    self._vec_rec[fid] = pos
+                    self.vec_updated.add(fid)
             # checkpoint / ann / signature records carry no frame state here
             pos = end
         return pos
@@ -415,6 +423,7 @@ class FrameStore:
     def _reset_state(self) -> None:
         self._offsets, self._voffs, self._times, self.metas = [], [], [], []
         self._event_offs = []
+        self._vec_rec = {}
         self.deleted = {}
         self.checkpoint_arrays = None
         self.tail_texts = []
@@ -433,6 +442,7 @@ class FrameStore:
         self._offsets = arrays["offsets"].tolist()
         self._voffs = arrays["voffs"].tolist()
         self._event_offs = arrays["ev_offs"].tolist() if "ev_offs" in arrays else []
+        self._vec_rec = dict(zip(arrays["vu_ids"].tolist(), arrays["vu_offs"].tolist())) if "vu_ids" in arrays else {}
         self._times = arrays["times"].tolist()
         self.metas = json.loads(arrays["metas"].tobytes())
         self.deleted = dict(zip(arrays["del_ids"].tolist(), arrays["del_t"].tolist()))
@@ -449,16 +459,8 @@ class FrameStore:
             return out
         data = self._data()
         try:
-            if self._cipher is not None:
-                for i, fid in enumerate(range(start, len(self._offsets))):
-                    off = self._offsets[fid]
-                    (n,) = _LEN.unpack_from(data, off)
-                    plain = self._plain(data[off + 4], bytes(data[off + 5 : off + 4 + n]), off)
-                    (jl,) = _JLEN.unpack_from(plain, 0)
-                    out[i] = np.frombuffer(plain, self._vdt, self.dim, 4 + jl)
-            else:
-                for i, off in enumerate(self._voffs[start:]):
-                    out[i] = np.frombuffer(data, self._vdt, self.dim, off)
+            for i, fid in enumerate(range(start, len(self._voffs))):
+                out[i] = self._vector_at(data, fid)
         finally:
             if isinstance(data, mmap.mmap):
                 try:
@@ -467,15 +469,51 @@ class FrameStore:
                     pass
         return out
 
+    def _vector_at(self, data, fid: int) -> np.ndarray:
+        if fid in self._vec_rec:  # enriched later: newest REC_VECTOR wins
+            off = self._vec_rec[fid]
+            (n,) = _LEN.unpack_from(data, off)
+            plain = self._plain(REC_VECTOR, bytes(data[off + 5 : off + 4 + n]), off)
+            return np.frombuffer(plain, self._vdt, self.dim, 8)
+        if self._cipher is not None:
+            off = self._offsets[fid]
+            (n,) = _LEN.unpack_from(data, off)
+            plain = self._plain(data[off + 4], bytes(data[off + 5 : off + 4 + n]), off)
+            (jl,) = _JLEN.unpack_from(plain, 0)
+            return np.frombuffer(plain, self._vdt, self.dim, 4 + jl)
+        return np.frombuffer(data, self._vdt, self.dim, self._voffs[fid])
+
+    def vector(self, fid: int) -> np.ndarray:
+        data = self._data()
+        try:
+            return np.array(self._vector_at(data, fid), dtype=np.float32)
+        finally:
+            if isinstance(data, mmap.mmap):
+                try:
+                    data.close()
+                except BufferError:
+                    pass
+
+    def set_vector(self, fid: int, vec: np.ndarray) -> None:
+        """Record a (new) embedding for an existing frame. The frame record itself is immutable."""
+        if not 0 <= fid < len(self._times):
+            raise IndexError(fid)
+        v = np.asarray(vec, dtype=np.float32).reshape(-1)
+        if v.shape[0] != self.dim:
+            raise ValueError(f"vector dim {v.shape[0]} != {self.dim}")
+        off = self._append_record(REC_VECTOR, struct.pack("<Q", fid) + v.astype(self._vdt).tobytes())
+        self._vec_rec[fid] = off
+
     def meta_of(self, fid: int) -> dict:
         return self.metas[fid] or {}
 
-    def refresh(self) -> tuple[int, set[int]]:
+    def refresh(self) -> tuple[int, set[int], set[int]]:
         """Pick up records appended (by a writer in another process) since we
         last looked. Returns (first new frame id, ids newly tombstoned).
-        Raises FileChangedError if the file was replaced/truncated (compaction)."""
+        Raises FileChangedError if the file was replaced/truncated (compaction).
+        Also returns ids whose embedding was enriched."""
         if self._fd is None:
-            return len(self._times), set()
+            return len(self._times), set(), set()
         size = os.fstat(self._fd).st_size
         try:
             same = os.path.samestat(os.fstat(self._fd), os.stat(self.path))
@@ -485,7 +523,7 @@ class FrameStore:
             raise FileChangedError("file was replaced or truncated")
         first, before = len(self._times), set(self.deleted)
         if size == self._end:
-            return first, set()
+            return first, set(), set()
         data = self._data()
         try:
             self._end = self._replay(data, self._end, size)
@@ -495,7 +533,8 @@ class FrameStore:
                     data.close()
                 except BufferError:
                     pass
-        return first, set(self.deleted) - before
+        upd, self.vec_updated = {f for f in self.vec_updated if f < first}, set()
+        return first, set(self.deleted) - before, upd
 
     # records ------------------------------------------------------------------
     def _append_record(self, rtype: int, payload: bytes) -> int:
@@ -565,6 +604,8 @@ class FrameStore:
             "offsets": np.asarray(self._offsets, dtype=np.int64),
             "voffs": np.asarray(self._voffs, dtype=np.int64),
             "ev_offs": np.asarray(self._event_offs, dtype=np.int64),
+            "vu_ids": np.asarray(list(self._vec_rec), dtype=np.int64),
+            "vu_offs": np.asarray(list(self._vec_rec.values()), dtype=np.int64),
             "times": np.asarray(self._times, dtype=np.float64),
             "metas": np.frombuffer(json.dumps(self.metas, separators=(",", ":")).encode(), np.uint8),
             "del_ids": np.asarray(list(self.deleted), dtype=np.int64),

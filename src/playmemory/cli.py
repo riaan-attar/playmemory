@@ -140,12 +140,15 @@ def main(argv: list[str] | None = None) -> int:
     dr.add_argument("--replace", action="store_true", help="with --write: keep the damaged file as FILE.corrupt and replace it")
     sub.add_parser("checkpoint")
     c = sub.add_parser("compact"); c.add_argument("--keep-history", action="store_true")
+    en = sub.add_parser("enrich", help="embed frames that were ingested with --defer-embedding")
+    en.add_argument("--batch", type=int, default=64)
     sub.add_parser("export", help="dump all frames as JSONL")
     ig = sub.add_parser("ingest", help="chunk and add files / directories")
     ig.add_argument("paths", nargs="+")
     ig.add_argument("--max-chars", type=int, default=800)
     ig.add_argument("--overlap", type=int, default=100)
     ig.add_argument("--transcribe", metavar="MODEL", help="transcribe audio/video with faster-whisper (e.g. base)")
+    ig.add_argument("--defer-embedding", action="store_true", help="index keywords now, embed later with `enrich`")
     ig.add_argument("--append", action="store_true", help="re-add changed files instead of replacing their old chunks")
     sv = sub.add_parser("serve", help="run an MCP server on stdio")
     sv.add_argument("--tenant", help="serve as this tenant: only frames with meta.tenant == TENANT are visible")
@@ -195,12 +198,14 @@ def main(argv: list[str] | None = None) -> int:
                     d["before"] = [_frame_dict(x) for x in h.before]
                     d["after"] = [_frame_dict(x) for x in h.after]
                 _print(d)
+        elif args.cmd == "enrich":
+            _print({"embedded": m.enrich(batch=args.batch), **{k: v for k, v in m.stats().items() if k == "pending_embeddings"}})
         elif args.cmd == "ingest":
             from dataclasses import asdict
 
             rep = m.ingest(args.paths, max_chars=args.max_chars, overlap=args.overlap,
                            on_change="append" if args.append else "replace",
-                           transcriber=_transcriber(args.transcribe))
+                           transcriber=_transcriber(args.transcribe), defer_embedding=args.defer_embedding)
             m.commit()
             d = asdict(rep)
             d.pop("frame_ids")

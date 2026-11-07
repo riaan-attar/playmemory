@@ -162,6 +162,8 @@ class Memory:
         self.store.tail_texts = []
         if len(self.store):
             self.index.add(self.store.load_vectors())
+        self._pending = (set(np.flatnonzero(np.linalg.norm(self.index.vectors, axis=1) == 0).tolist())
+                         if len(self.store) else set())
         self.ann: AnnIndex | None = None
         saved = self.store.read_ann() if self.ann_threshold is not None else None
         if saved and saved[0] <= len(self.store):
@@ -210,8 +212,11 @@ class Memory:
         metas: list[dict | None] | None = None,
         times: list[float | None] | None = None,
         vectors: np.ndarray | None = None,
+        defer_embedding: bool = False,
     ) -> list[Frame]:
-        """Add frames. `vectors` (n, dim) skips embedding the texts (precomputed/cached/image vectors)."""
+        """Add frames. `vectors` (n, dim) skips embedding the texts (precomputed/cached/image vectors).
+        defer_embedding=True stores them with a zero vector: they are keyword-searchable at once and
+        get their embeddings later from enrich()."""
         import json
 
         for i, text in enumerate(texts):
@@ -219,10 +224,14 @@ class Memory:
                 raise ValueError(f"text {i} exceeds {self.max_text_bytes} bytes")
             if metas and metas[i] and len(json.dumps(metas[i])) > self.max_meta_bytes:
                 raise ValueError(f"meta {i} exceeds {self.max_meta_bytes} bytes")
+        if defer_embedding:
+            vectors = np.zeros((len(texts), self.embedder.dim), dtype=np.float32)
         vecs = self.embedder.embed(texts) if vectors is None else np.asarray(vectors, dtype=np.float32)
         if vecs.shape != (len(texts), self.embedder.dim):
             raise ValueError(f"vectors must have shape ({len(texts)}, {self.embedder.dim})")
         frames = self._append(texts, metas, times, vecs)
+        if defer_embedding:
+            self._pending.update(f.id for f in frames)
         self._log("add", {"count": len(frames)}, [f.id for f in frames])
         return frames
 
@@ -257,6 +266,25 @@ class Memory:
         metas = [{**(metas[i] or {} if metas else {}), "kind": "image", "source": str(Path(p).resolve())}
                  for i, p in enumerate(paths)]
         return self.add_many(texts, metas, times, vectors=self.embedder.embed_images(paths))
+
+    @_writes
+    def enrich(self, batch: int = 64, limit: int | None = None) -> int:
+        """Embed frames added with defer_embedding=True (or whose embedding is empty), in batches.
+        Returns how many were embedded. Safe to call repeatedly or from a worker."""
+        todo = sorted(self._pending)[: limit if limit is not None else None]
+        done = 0
+        for i in range(0, len(todo), batch):
+            ids = todo[i : i + batch]
+            vecs = self.embedder.embed([self.store.get(f).text for f in ids])
+            for fid, v in zip(ids, vecs):
+                self.store.set_vector(fid, v)
+                self.index.set(fid, v)
+                self._pending.discard(fid)
+            done += len(ids)
+        if done:
+            self.ann = None  # the HNSW graph holds the old (zero) vectors; rebuilt at the next checkpoint
+            self.store.sync()
+        return done
 
     @_writes
     def forget(self, fid: int, t: float | None = None) -> None:
@@ -372,7 +400,7 @@ class Memory:
     # multi-process reads -------------------------------------------------------
     def _refresh_impl(self) -> int:
         try:
-            first, newdel = self.store.refresh()
+            first, newdel, upd = self.store.refresh()
         except FileChangedError:  # writer compacted/replaced the file: start over
             self.store.close()
             self._open()
@@ -392,6 +420,10 @@ class Memory:
                 self.ann.add(vecs)
         for fid in newdel:
             self._del_np[fid] = self.store.deleted[fid]
+        for fid in upd:  # a writer enriched these embeddings
+            self.index.set(fid, self.store.vector(fid))
+            self._pending.discard(fid)
+            self.ann = None
         return n - first
 
     def refresh(self) -> int:
@@ -847,6 +879,7 @@ class Memory:
             "dropped_bytes_on_open": s.dropped_bytes,
             "episodes": len(self.episodes),
             "ann": self.ann is not None,
+            "pending_embeddings": len(self._pending),
             "encrypted": self.store._cipher is not None,
             "embedder": self.embedder.name,
             "dim": self.embedder.dim,

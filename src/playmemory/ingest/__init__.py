@@ -33,7 +33,7 @@ def _files(paths, recursive: bool):
 
 def ingest_paths(mem, paths, *, max_chars: int = 800, overlap: int = 100, recursive: bool = True,
                  meta: dict | None = None, t: float | None = None, on_change: str = "replace",
-                 transcriber=None) -> IngestReport:
+                 transcriber=None, defer_embedding: bool = False) -> IngestReport:
     """Chunk and add files (or directories) to `mem`. Idempotent: an unchanged file
     (same content hash) is skipped; a changed one has its old chunks forgotten first
     (on_change="replace") or is added again (on_change="append")."""
@@ -72,7 +72,7 @@ def ingest_paths(mem, paths, *, max_chars: int = 800, overlap: int = 100, recurs
                     mem.forget(fr.id)
                 if old:
                     rep.replaced.append(src)
-            frames = mem.add_many(texts, metas, times) if texts else []
+            frames = mem.add_many(texts, metas, times, defer_embedding=defer_embedding) if texts else []
             rep.frame_ids += [fr.id for fr in frames]
             rep.files += 1
             rep.chunks += len(frames)
