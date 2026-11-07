@@ -359,6 +359,15 @@ class Memory:
         return Hit(s.get(fid), score, tuple(before), tuple(after))
 
     @_locked
+    def find(self, where: dict[str, Any], limit: int | None = None,
+             as_of: float | None = None) -> list[Frame]:
+        """Live frames whose meta matches `where`, in timeline order."""
+        ids = np.flatnonzero(self._mask(as_of, where))
+        if limit is not None:
+            ids = ids[-limit:]
+        return [self.store.get(int(i)) for i in ids]
+
+    @_locked
     def get(self, fid: int) -> Frame:
         return self.store.get(fid)
 

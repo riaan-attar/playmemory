@@ -71,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("checkpoint")
     c = sub.add_parser("compact"); c.add_argument("--keep-history", action="store_true")
     sub.add_parser("export", help="dump all frames as JSONL")
+    sub.add_parser("serve", help="run an MCP server on stdio")
     args = ap.parse_args(argv)
 
     with warnings.catch_warnings():
@@ -117,6 +118,10 @@ def main(argv: list[str] | None = None) -> int:
             _print(m.stats())
         elif args.cmd == "compact":
             _print(m.compact(keep_history=args.keep_history))
+        elif args.cmd == "serve":
+            from .server import MemoryServer
+
+            MemoryServer(m).serve()
         elif args.cmd == "export":
             for i in range(len(m)):
                 fr = m.get(i)
