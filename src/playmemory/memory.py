@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import bisect
+import functools
 import os
+import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -11,17 +14,41 @@ from .embed import Embedder, HashEmbedder
 from .frame import Frame, Hit
 from .index import SegmentIndex
 from .lexical import BM25Index
-from .store import FrameStore
+from .store import FrameStore, _fsync_dir
 
 RRF_K = 60
+MAX_TEXT_BYTES = 1 << 20  # 1 MiB per frame
+MAX_META_BYTES = 64 << 10
+
+
+def _locked(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *a, **kw):
+        with self._lock:
+            return fn(self, *a, **kw)
+
+    return wrapper
+
+
+def _writes(fn):
+    @functools.wraps(fn)
+    def wrapper(self, *a, **kw):
+        if self.read_only:
+            raise PermissionError("memory opened read-only")
+        with self._lock:
+            return fn(self, *a, **kw)
+
+    return wrapper
 
 
 class Memory:
     """Timeline memory with hybrid (BM25 + vector) retrieval.
 
     path=None keeps everything in RAM. With a path, everything (frames,
-    embeddings, tombstones) lives in ONE file; BM25 and the vector matrix are
-    rebuilt from it on open.
+    embeddings, tombstones, index checkpoints) lives in ONE file.
+    One writer process at a time (exclusive lock); any number of
+    read_only=True openers. Thread-safe within a process.
+    sync: "always" | "batch" (fsync on commit/close) | "never".
     """
 
     def __init__(
@@ -30,18 +57,41 @@ class Memory:
         embedder: Embedder | None = None,
         segment_size: int = 64,
         approx: bool = False,
+        *,
+        read_only: bool = False,
+        sync: str = "batch",
+        sync_every: int = 0,
+        max_text_bytes: int = MAX_TEXT_BYTES,
+        max_meta_bytes: int = MAX_META_BYTES,
     ):
+        self.path = Path(path) if path else None
         self.embedder = embedder or HashEmbedder()
-        self.store = FrameStore(path, self.embedder.dim, self.embedder.name)
+        self.read_only = read_only
+        self.segment_size = segment_size
         self.approx = approx
-        self.index = SegmentIndex(
-            self.embedder.dim, segment_size, exact_below=2048 if approx else 1 << 62
+        self.max_text_bytes = max_text_bytes
+        self.max_meta_bytes = max_meta_bytes
+        self._sync, self._sync_every = sync, sync_every
+        self._lock = threading.RLock()
+        self._open()
+
+    def _open(self) -> None:
+        self.store = FrameStore(
+            self.path, self.embedder.dim, self.embedder.name,
+            read_only=self.read_only, sync=self._sync, sync_every=self._sync_every,
         )
-        self.bm25 = BM25Index()
+        self.index = SegmentIndex(
+            self.embedder.dim, self.segment_size,
+            exact_below=2048 if self.approx else 1 << 62,
+        )
+        cp = self.store.checkpoint_arrays
+        self.bm25 = BM25Index.from_arrays(cp) if cp is not None else BM25Index()
+        for fid, text in self.store.tail_texts:
+            assert len(self.bm25) == fid, "index/log out of step"
+            self.bm25.add(text)
+        self.store.tail_texts = []
         if len(self.store):
-            self.index.add(self.store.take_loaded_vectors())
-            for f in self.store.range(0, len(self.store)):
-                self.bm25.add(f.text)
+            self.index.add(self.store.load_vectors())
 
     def __len__(self) -> int:
         return len(self.store)
@@ -50,30 +100,44 @@ class Memory:
     def add(self, text: str, meta: dict | None = None, t: float | None = None) -> Frame:
         return self.add_many([text], [meta], [t])[0]
 
+    @_writes
     def add_many(
         self,
         texts: list[str],
         metas: list[dict | None] | None = None,
         times: list[float | None] | None = None,
     ) -> list[Frame]:
+        import json
+
+        for i, text in enumerate(texts):
+            if len(text.encode()) > self.max_text_bytes:
+                raise ValueError(f"text {i} exceeds {self.max_text_bytes} bytes")
+            if metas and metas[i] and len(json.dumps(metas[i])) > self.max_meta_bytes:
+                raise ValueError(f"meta {i} exceeds {self.max_meta_bytes} bytes")
         vecs = self.embedder.embed(texts)
+        return self._append(texts, metas, times, vecs)
+
+    def _append(self, texts, metas, times, vecs) -> list[Frame]:
         now = time.time()
         last = self.store.times[-1] if len(self.store) else now
         frames = []
         for i, text in enumerate(texts):
-            t = times[i] if times and times[i] is not None else max(now, last)
-            frames.append(
-                self.store.append(t, text, metas[i] if metas else None, vecs[i])
-            )
+            if times and times[i] is not None:
+                t = times[i]
+            else:  # wall clock may step backwards: never go below the last frame
+                t = max(now, last)
+            frames.append(self.store.append(t, text, metas[i] if metas else None, vecs[i]))
             self.bm25.add(text)
             last = t
         self.index.add(vecs)
         return frames
 
+    @_writes
     def forget(self, fid: int, t: float | None = None) -> None:
         """Tombstone a frame: hidden from current search, kept for as_of queries."""
         self.store.delete(fid, time.time() if t is None else t)
 
+    @_writes
     def supersede(self, old_id: int, text: str, meta: dict | None = None,
                   t: float | None = None) -> Frame:
         """Replace a stale fact: add the new frame and tombstone the old one."""
@@ -81,6 +145,56 @@ class Memory:
         new = self.add(text, {**(meta or {}), "supersedes": old_id}, now)
         self.store.delete(old_id, new.t)
         return new
+
+    # durability ---------------------------------------------------------------
+    @_writes
+    def commit(self) -> None:
+        """Group commit: fsync everything written so far."""
+        self.store.sync()
+
+    @_writes
+    def checkpoint(self) -> None:
+        """Persist BM25 + offsets so the next open replays only the tail."""
+        self.store.write_checkpoint(self.bm25.to_arrays())
+        self.store.sync()
+
+    @_writes
+    def compact(self, keep_history: bool = False) -> dict[str, int]:
+        """Rewrite the file atomically, dropping old checkpoints (and, unless
+        keep_history, deleted frames). Stored embeddings are reused."""
+        if self.path is None:
+            raise ValueError("in-memory memory cannot be compacted")
+        before = self.store.nbytes
+        s = self.store
+        keep = [i for i in range(len(s)) if keep_history or i not in s.deleted]
+        remap = {old: new for new, old in enumerate(keep)}
+        tmp = self.path.with_name(self.path.name + ".compact")
+        if tmp.exists():
+            tmp.unlink()
+        new = Memory(tmp, self.embedder, self.segment_size, self.approx, sync="never")
+        vecs = self.index.vectors[keep] if keep else np.zeros((0, self.embedder.dim), np.float32)
+        for k, old in enumerate(keep):
+            f = s.get(old)
+            meta = dict(f.meta)
+            if "supersedes" in meta:
+                if meta["supersedes"] in remap:
+                    meta["supersedes"] = remap[meta["supersedes"]]
+                else:
+                    del meta["supersedes"]
+            new.store.append(f.t, f.text, meta, vecs[k])
+            new.bm25.add(f.text)
+        if len(keep):
+            new.index.add(vecs)
+        if keep_history:
+            for old, dt in s.deleted.items():
+                new.store.delete(remap[old], dt)
+        new.checkpoint()
+        new.store.close()
+        s.close()
+        os.replace(tmp, self.path)
+        _fsync_dir(self.path)
+        self._open()
+        return {"bytes_before": before, "bytes_after": self.store.nbytes, "frames": len(keep)}
 
     # reading ------------------------------------------------------------------
     def _mask(self, as_of: float | None, where: dict[str, Any] | None) -> np.ndarray:
@@ -99,6 +213,7 @@ class Memory:
                     mask[i] = False
         return mask
 
+    @_locked
     def search(
         self,
         query: str,
@@ -164,9 +279,11 @@ class Memory:
             after = [f for f in after if f.t <= as_of]
         return Hit(s.get(fid), score, tuple(before), tuple(after))
 
+    @_locked
     def get(self, fid: int) -> Frame:
         return self.store.get(fid)
 
+    @_locked
     def seek(self, t: float) -> Frame | None:
         """The live frame in effect at time t (last live frame with time <= t)."""
         i = self.store.seek_time(t)
@@ -174,13 +291,43 @@ class Memory:
             i -= 1
         return None if i is None or i < 0 else self.store.get(i)
 
+    @_locked
     def window(self, t0: float, t1: float) -> list[Frame]:
         lo, hi = self.store.time_range(t0, t1)
         return self.store.range(lo, hi, True)
 
-    def save(self) -> None:
-        self.store.sync()
+    @_locked
+    def stats(self) -> dict[str, Any]:
+        s = self.store
+        return {
+            "frames": len(s),
+            "live": len(s) - len(s.deleted),
+            "deleted": len(s.deleted),
+            "bytes": s.nbytes,
+            "checkpoints": s.checkpoints,
+            "frames_since_checkpoint": s.tail_records,
+            "dropped_bytes_on_open": s.dropped_bytes,
+            "embedder": self.embedder.name,
+            "dim": self.embedder.dim,
+        }
+
+    def save(self) -> None:  # backwards-compatible alias
+        if not self.read_only:
+            self.commit()
 
     def close(self) -> None:
-        self.save()
-        self.store.close()
+        with self._lock:
+            if self.store._fd is None and self.path is not None:
+                return
+            if not self.read_only and self.path is not None:
+                # checkpoint only when the un-indexed tail is big: each one
+                # adds a (compactable) record, so avoid one per open/close
+                if self.store.tail_records >= max(1000, len(self.store) // 10):
+                    self.checkpoint()
+            self.store.close()
+
+    def __enter__(self) -> "Memory":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import math
 import re
+
+import numpy as np
 from collections import defaultdict
 
 _TOKEN = re.compile(r"[a-z0-9]+")
@@ -52,3 +55,30 @@ class BM25Index:
         ranked = sorted(((f, s) for f, s in scores.items() if valid(f)),
                         key=lambda x: -x[1])
         return ranked[:k]
+
+    # persistence (checkpoint) ------------------------------------------------
+    def to_arrays(self) -> dict[str, np.ndarray]:
+        terms = list(self.postings)
+        lens = [len(self.postings[t]) for t in terms]
+        flat = [p for t in terms for p in self.postings[t]]
+        ids = np.fromiter((f for f, _ in flat), dtype=np.int32, count=len(flat))
+        tfs = np.fromiter((c for _, c in flat), dtype=np.int32, count=len(flat))
+        return {
+            "bm_terms": np.frombuffer(json.dumps(terms).encode(), np.uint8),
+            "bm_ptr": np.concatenate([[0], np.cumsum(lens)]).astype(np.int64),
+            "bm_ids": ids,
+            "bm_tf": tfs,
+            "bm_len": np.asarray(self.doc_len, dtype=np.int32),
+        }
+
+    @classmethod
+    def from_arrays(cls, a: dict[str, np.ndarray], **kw) -> "BM25Index":
+        self = cls(**kw)
+        terms = json.loads(a["bm_terms"].tobytes())
+        ptr, ids, tfs = a["bm_ptr"], a["bm_ids"].tolist(), a["bm_tf"].tolist()
+        for i, t in enumerate(terms):
+            lo, hi = int(ptr[i]), int(ptr[i + 1])
+            self.postings[t] = list(zip(ids[lo:hi], tfs[lo:hi]))
+        self.doc_len = a["bm_len"].tolist()
+        self._total_len = int(sum(self.doc_len))
+        return self
