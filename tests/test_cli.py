@@ -44,3 +44,17 @@ def test_cli_verify_detects_corruption(tmp_path, capsys, monkeypatch):
     f.write_bytes(bytes(raw))
     code, out = run(capsys, str(f), "verify")
     assert code == 2 and not out[0]["ok"]
+
+
+def test_cli_story_and_read(tmp_path, capsys, monkeypatch):
+    f = str(tmp_path / "m.pmem")
+    lines = [f"the detective inspected knife {i} at the mansion" for i in range(8)] + \
+            [f"mix flour sugar butter step {i} for the cake" for i in range(8)]
+    run(capsys, f, "add", stdin="\n".join(lines) + "\n", monkeypatch=monkeypatch)
+    code, out = run(capsys, f, "story", "detective knife mansion", "--budget", "100000")
+    sp = out[0]
+    assert sp["frames"][0]["text"].startswith("the detective") and sp["scene_frames"] >= len(sp["frames"])
+    code, out = run(capsys, f, "story", "detective knife mansion", "--pointers")
+    assert "frames" not in out[0]
+    code, out = run(capsys, f, "read", str(sp["start_id"]), str(sp["end_id"]))
+    assert [o["id"] for o in out] == [x["id"] for x in sp["frames"]]

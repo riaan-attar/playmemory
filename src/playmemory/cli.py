@@ -63,6 +63,14 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--as-of", type=float)
     s.add_argument("--where", help="JSON object")
     s.add_argument("--recency", type=float, help="half-life in seconds")
+    st = sub.add_parser("story", help="return the timeline span(s) that cover a query")
+    st.add_argument("query")
+    st.add_argument("-k", type=int, default=1, help="number of spans")
+    st.add_argument("--budget", type=int, default=4000, help="max characters")
+    st.add_argument("--as-of", type=float)
+    st.add_argument("--pointers", action="store_true", help="only print start/end ids, not text")
+    rd = sub.add_parser("read", help="read a span by frame ids (inclusive)")
+    rd.add_argument("start", type=int); rd.add_argument("end", type=int)
     k = sub.add_parser("seek"); k.add_argument("t", type=float)
     w = sub.add_parser("window"); w.add_argument("t0", type=float); w.add_argument("t1", type=float)
     f = sub.add_parser("forget"); f.add_argument("id", type=int)
@@ -81,7 +89,7 @@ def main(argv: list[str] | None = None) -> int:
             records, bad = st.verify()
             _print({"records": records, "bad_bytes": bad, "ok": bad == 0})
             return 0 if bad == 0 else 2
-        read_only = args.cmd in ("search", "seek", "window", "stats", "export")
+        read_only = args.cmd in ("search", "story", "read", "seek", "window", "stats", "export")
         m = _open(args, read_only)
     try:
         if args.cmd == "add":
@@ -101,6 +109,16 @@ def main(argv: list[str] | None = None) -> int:
                     d["before"] = [_frame_dict(x) for x in h.before]
                     d["after"] = [_frame_dict(x) for x in h.after]
                 _print(d)
+        elif args.cmd == "story":
+            for sp in m.recall_span(args.query, args.k, args.budget, as_of=args.as_of):
+                d = {"start_id": sp.start_id, "end_id": sp.end_id, "t0": sp.t0, "t1": sp.t1,
+                     "scene_frames": sp.episode_len, "summary": sp.summary, "score": round(sp.score, 4)}
+                if not args.pointers:
+                    d["frames"] = [_frame_dict(f) for f in sp.frames]
+                _print(d)
+        elif args.cmd == "read":
+            for fr in m.read(args.start, args.end):
+                _print(_frame_dict(fr))
         elif args.cmd == "seek":
             fr = m.seek(args.t)
             _print(_frame_dict(fr) if fr else None)

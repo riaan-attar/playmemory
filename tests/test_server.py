@@ -21,7 +21,7 @@ def test_handshake_and_tools():
     assert rpc(srv, "initialize")["result"]["serverInfo"]["name"] == "playmemory"
     assert srv.handle({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
     names = {t["name"] for t in rpc(srv, "tools/list")["result"]["tools"]}
-    assert {"remember", "recall", "forget", "seek", "timeline", "profile", "stats"} <= names
+    assert {"remember", "recall", "recall_story", "read_span", "forget", "seek", "timeline", "profile", "stats"} <= names
     assert rpc(srv, "nope")["error"]["code"] == -32601
 
 
@@ -67,3 +67,17 @@ def test_stdio_subprocess(tmp_path):
     assert "Fridays" in hit["frame"]["text"]
     with Memory(f, read_only=True) as m:  # persisted by the server process
         assert len(m) >= 1
+
+
+def test_story_and_read_span_tools():
+    srv = MemoryServer(Memory())
+    for i in range(6):
+        call(srv, "remember", text=f"the detective found knife number {i} near the victim", extract_cards=False)
+    for i in range(6):
+        call(srv, "remember", text=f"baking a cake with flour and sugar step {i}", extract_cards=False)
+    spans, err = call(srv, "recall_story", query="what did the detective find", budget_chars=100000)
+    assert not err and spans[0]["start_id"] <= 0 and "detective" in spans[0]["frames"][0]["text"]
+    ptr, _ = call(srv, "recall_story", query="what did the detective find", pointers_only=True)
+    assert "frames" not in ptr[0]
+    again, _ = call(srv, "read_span", start_id=ptr[0]["start_id"], end_id=ptr[0]["end_id"])
+    assert [f["id"] for f in again] == [f["id"] for f in spans[0]["frames"]]

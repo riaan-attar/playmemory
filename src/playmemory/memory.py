@@ -12,9 +12,10 @@ import numpy as np
 
 from .ann import AnnIndex
 from .embed import Embedder, HashEmbedder
-from .frame import Frame, Hit
+from .episodes import EpisodeConfig, EpisodeIndex
+from .frame import Frame, Hit, Span
 from .index import SegmentIndex
-from .lexical import BM25Index
+from .lexical import BM25Index, tokenize
 from .store import FrameStore, _fsync_dir
 
 RRF_K = 60
@@ -60,6 +61,7 @@ class Memory:
         approx: bool = False,
         *,
         ann_threshold: int | None = 200_000,
+        episode_config: EpisodeConfig | None = None,
         read_only: bool = False,
         sync: str = "batch",
         sync_every: int = 0,
@@ -81,6 +83,7 @@ class Memory:
         self.segment_size = segment_size
         self.approx = approx
         self.ann_threshold = ann_threshold
+        self.episode_config = episode_config or EpisodeConfig()
         self.max_text_bytes = max_text_bytes
         self.max_meta_bytes = max_meta_bytes
         self._sync, self._sync_every = sync, sync_every
@@ -98,6 +101,8 @@ class Memory:
         )
         cp = self.store.checkpoint_arrays
         self.bm25 = BM25Index.from_arrays(cp) if cp is not None else BM25Index()
+        self.episodes = (EpisodeIndex.from_arrays(cp, self.episode_config)
+                         if cp is not None and "ep_starts" in cp else EpisodeIndex(self.episode_config))
         for fid, text in self.store.tail_texts:
             assert len(self.bm25) == fid, "index/log out of step"
             self.bm25.add(text)
@@ -208,7 +213,8 @@ class Memory:
         """Persist BM25 + offsets so the next open replays only the tail."""
         if self.ann is None and self.ann_threshold is not None and len(self.store) >= self.ann_threshold:
             self.build_ann()
-        self.store.write_checkpoint(self.bm25.to_arrays())
+        self._sync_episodes()
+        self.store.write_checkpoint({**self.bm25.to_arrays(), **self.episodes.to_arrays()})
         if self.ann is not None:
             self.store.write_ann(self.ann.to_bytes(), len(self.ann))
         self.store.sync()
@@ -233,7 +239,8 @@ class Memory:
         if tmp.exists():
             tmp.unlink()
         new = Memory(tmp, self.embedder, self.segment_size, self.approx,
-                     ann_threshold=self.ann_threshold, sync="never")
+                     ann_threshold=self.ann_threshold, episode_config=self.episode_config,
+                     sync="never")
         vecs = self.index.vectors[keep] if keep else np.zeros((0, self.embedder.dim), np.float32)
         for k, old in enumerate(keep):
             f = s.get(old)
@@ -299,6 +306,12 @@ class Memory:
         deletions are invisible). where: exact-match filter on frame meta.
         recency_half_life: multiply scores by 0.5**(age/half_life).
         """
+        ranked = self._rank(query, mode, as_of, where, recency_half_life, pool, exact)
+        return [self._hit(fid, score, context, as_of) for fid, score in ranked[:k]]
+
+    def _rank(self, query: str, mode: str, as_of: float | None, where: dict[str, Any] | None,
+              recency_half_life: float | None, pool: int, exact: bool) -> list[tuple[int, float]]:
+        """Ranked (frame id, score) candidates, best first, at most ~pool of them."""
         n = len(self.store)
         if n == 0:
             return []
@@ -338,7 +351,7 @@ class Memory:
             ranked = [(f, s * 0.5 ** (max(ref - times[f], 0) / recency_half_life))
                       for f, s in ranked]
         ranked.sort(key=lambda x: -x[1])
-        return [self._hit(fid, score, context, as_of) for fid, score in ranked[:k]]
+        return ranked
 
     def _exact_vec(self, q: np.ndarray, mask: np.ndarray, pool: int, visible: int):
         scores = self.index.vectors @ q
@@ -357,6 +370,103 @@ class Memory:
         if as_of is not None:
             after = [f for f in after if f.t <= as_of]
         return Hit(s.get(fid), score, tuple(before), tuple(after))
+
+    def _sync_episodes(self) -> None:
+        if len(self.store) != getattr(self.episodes, "_n", -1) or not len(self.episodes):
+            self.episodes.sync(self.index.vectors, self.store.metas, self.store.times)
+
+    @_locked
+    def episode_list(self) -> list[tuple[int, int]]:
+        """[(start_id, end_id_inclusive)] for every scene on the timeline."""
+        self._sync_episodes()
+        return [(a, b - 1) for a, b in self.episodes.bounds()]
+
+    @_locked
+    def read(self, start_id: int, end_id: int, as_of: float | None = None) -> list[Frame]:
+        """The frames of a span pointer (inclusive ids), minus forgotten/future ones."""
+        return self.store.range(start_id, end_id + 1, True, as_of)
+
+    @_locked
+    def recall_span(self, query: str, k: int = 1, budget_chars: int = 4000, *,
+                    mode: str = "hybrid", as_of: float | None = None,
+                    where: dict[str, Any] | None = None, pool: int = 50) -> list[Span]:
+        """Return up to k contiguous timeline spans ("watch from A to B") that
+        best cover the query, each trimmed to its share of budget_chars.
+
+        Episodes (scenes) are ranked by their best-matching frame; inside an episode the span is grown around the best frames
+        toward whichever neighbour is more relevant until the budget is spent.
+        """
+        if len(self.store) == 0:
+            return []
+        self._sync_episodes()
+        ranked = self._rank(query, mode, as_of, where, None, pool, False)
+        if not ranked:
+            return []
+        fids = np.array([f for f, _ in ranked])
+        eps = self.episodes.episode_of(fids)
+        # a scene is ranked by its single best frame (summing many weak hits
+        # measured far worse: 39% vs 60% of top scenes containing the evidence)
+        ep_hits: dict[int, dict[int, float]] = {}
+        for (fid, sc), e in zip(ranked, eps):
+            ep_hits.setdefault(int(e), {})[fid] = sc
+        ep_score = {e: max(h.values()) + 1e-3 * sum(h.values()) for e, h in ep_hits.items()}
+        top = sorted(ep_score, key=lambda e: -ep_score[e])[:k]
+        per = max(budget_chars // max(len(top), 1), 1)
+        vis = self._mask(as_of, None)
+        q = self.embedder.embed([query])[0]
+        bounds = self.episodes.bounds()
+        spans: list[Span] = []
+        for e in top:
+            s, end = bounds[e]  # [s, end)
+            lo, hi = self._grow_span(s, end, ep_hits[e], vis, q, per)
+            frames = tuple(self.store.range(lo, hi + 1, True, as_of))
+            if not frames:
+                continue
+            spans.append(Span(lo, hi, frames[0].t, frames[-1].t, frames, ep_score[e], e, end - s,
+                              self._keywords(frames)))
+        spans.sort(key=lambda sp: sp.start_id)
+        return spans
+
+    def _grow_span(self, s: int, end: int, hits: dict[int, float], vis: np.ndarray,
+              q: np.ndarray, budget: int) -> tuple[int, int]:
+        """Pick [lo, hi] inside episode [s, end): cover the hit frames if they
+        fit, then expand toward the more query-similar neighbour while budget lasts."""
+        cost = {i: len(self.store.get(i).text) + 1 for i in range(s, end) if vis[i]}
+        rel = self.index.vectors[s:end] @ q
+        order = sorted((f for f in hits if f in cost), key=lambda f: -hits[f])
+        if not order:
+            order = [next(iter(cost), s)]
+        lo = hi = order[0]
+        used = cost.get(lo, 0)
+        for f in order[1:]:  # extend to also cover other evidence frames if affordable
+            nlo, nhi = min(lo, f), max(hi, f)
+            extra = sum(cost.get(i, 0) for i in range(nlo, nhi + 1)) - sum(cost.get(i, 0) for i in range(lo, hi + 1))
+            if used + extra <= budget:
+                used, lo, hi = used + extra, nlo, nhi
+        while True:
+            left = next((i for i in range(lo - 1, s - 1, -1) if i in cost), None)
+            right = next((i for i in range(hi + 1, end) if i in cost), None)
+            cands = [(rel[i - s], i, side) for i, side in ((left, "L"), (right, "R"))
+                     if i is not None and used + cost[i] <= budget]
+            if not cands:
+                break
+            _, i, side = max(cands)
+            used += cost[i]
+            lo, hi = (i, hi) if side == "L" else (lo, i)
+        return lo, hi
+
+    _STOP = frozenset("the and was for that with this have you are but not they his her she him from "
+                      "what when who how out about just like had been has were will would there their".split())
+
+    def _keywords(self, frames, n: int = 5) -> str:
+        tf: dict[str, int] = {}
+        for f in frames:
+            for t in tokenize(f.text):
+                if len(t) > 2 and t not in self._STOP:
+                    tf[t] = tf.get(t, 0) + 1
+        N = max(len(self.bm25), 1)
+        score = {t: c * np.log(1 + N / (1 + len(self.bm25.post_ids.get(t, ())))) for t, c in tf.items()}
+        return ", ".join(sorted(score, key=lambda t: -score[t])[:n])
 
     @_locked
     def find(self, where: dict[str, Any], limit: int | None = None,
@@ -395,6 +505,7 @@ class Memory:
             "checkpoints": s.checkpoints,
             "frames_since_checkpoint": s.tail_records,
             "dropped_bytes_on_open": s.dropped_bytes,
+            "episodes": len(self.episodes),
             "ann": self.ann is not None,
             "embedder": self.embedder.name,
             "dim": self.embedder.dim,

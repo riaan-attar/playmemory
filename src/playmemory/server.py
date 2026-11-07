@@ -31,6 +31,14 @@ def _tools() -> list[dict]:
          "inputSchema": {"type": "object", "required": ["query"], "properties": {
              "query": text, "k": integer, "context": integer, "as_of": num,
              "mode": {"enum": ["hybrid", "vector", "lexical"]}, "where": {"type": "object"}}}},
+        {"name": "recall_story", "description": "Find the stretch(es) of the timeline that cover a topic and return them as "
+         "contiguous spans: pointers (start_id, end_id, t0, t1, summary) plus the text. Prefer this for 'what happened with X' "
+         "questions; use read_span to fetch more of a span.",
+         "inputSchema": {"type": "object", "required": ["query"], "properties": {
+             "query": text, "k": integer, "budget_chars": integer, "as_of": num, "pointers_only": {"type": "boolean"}}}},
+        {"name": "read_span", "description": "Press play on a span: the frames between two ids (inclusive).",
+         "inputSchema": {"type": "object", "required": ["start_id", "end_id"], "properties": {
+             "start_id": integer, "end_id": integer, "as_of": num}}},
         {"name": "forget", "description": "Forget a memory by id (history is kept for as_of queries).",
          "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": integer}}},
         {"name": "seek", "description": "The memory in effect at a point in time.",
@@ -65,6 +73,14 @@ class MemoryServer:
             return [{"score": round(h.score, 4), "frame": _frame(h.frame),
                      "before": [_frame(f) for f in h.before], "after": [_frame(f) for f in h.after]}
                     for h in hits]
+        if name == "recall_story":
+            spans = m.recall_span(a["query"], a.get("k", 1), a.get("budget_chars", 4000), as_of=a.get("as_of"))
+            return [{"start_id": sp.start_id, "end_id": sp.end_id, "t0": sp.t0, "t1": sp.t1,
+                     "scene_frames": sp.episode_len, "summary": sp.summary, "score": round(sp.score, 4),
+                     **({} if a.get("pointers_only") else {"frames": [_frame(f) for f in sp.frames]})}
+                    for sp in spans]
+        if name == "read_span":
+            return [_frame(f) for f in m.read(int(a["start_id"]), int(a["end_id"]), a.get("as_of"))]
         if name == "forget":
             m.forget(int(a["id"]))
             m.commit()
