@@ -67,7 +67,16 @@ class Memory:
         max_meta_bytes: int = MAX_META_BYTES,
     ):
         self.path = Path(path) if path else None
-        self.embedder = embedder or HashEmbedder()
+        if embedder is None:
+            import warnings
+
+            warnings.warn(
+                "HashEmbedder is a non-semantic debug embedder; pass a real one "
+                "(OnnxEmbedder / SentenceTransformerEmbedder / HTTPEmbedder) in production",
+                stacklevel=2,
+            )
+            embedder = HashEmbedder()
+        self.embedder = embedder
         self.read_only = read_only
         self.segment_size = segment_size
         self.approx = approx
