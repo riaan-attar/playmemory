@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from .ann import AnnIndex
 from .embed import Embedder, HashEmbedder
 from .frame import Frame, Hit
 from .index import SegmentIndex
@@ -58,6 +59,7 @@ class Memory:
         segment_size: int = 64,
         approx: bool = False,
         *,
+        ann_threshold: int | None = 200_000,
         read_only: bool = False,
         sync: str = "batch",
         sync_every: int = 0,
@@ -69,6 +71,7 @@ class Memory:
         self.read_only = read_only
         self.segment_size = segment_size
         self.approx = approx
+        self.ann_threshold = ann_threshold
         self.max_text_bytes = max_text_bytes
         self.max_meta_bytes = max_meta_bytes
         self._sync, self._sync_every = sync, sync_every
@@ -92,6 +95,38 @@ class Memory:
         self.store.tail_texts = []
         if len(self.store):
             self.index.add(self.store.load_vectors())
+        self.ann: AnnIndex | None = None
+        saved = self.store.read_ann() if self.ann_threshold is not None else None
+        if saved and saved[0] <= len(self.store):
+            try:
+                self.ann = AnnIndex.from_bytes(saved[1])
+                if len(self.ann) < len(self.store):  # frames added since it was saved
+                    self.ann.add(self.index.vectors[len(self.ann):])
+            except ImportError:
+                self.ann = None
+        # numpy mirrors used to build visibility masks without Python loops
+        n = len(self.store)
+        self._cap = max(1024, n * 2)
+        self._del_np = np.full(self._cap, np.inf)  # deletion time, inf = alive
+        for fid, dt in self.store.deleted.items():
+            self._del_np[fid] = dt
+        self._meta_ix: dict[str, dict[Any, list[int]]] = {}
+        for fid, m in enumerate(self.store.metas):
+            self._index_meta(fid, m)
+
+    def _index_meta(self, fid: int, meta: dict) -> None:
+        for k, v in meta.items():
+            try:
+                self._meta_ix.setdefault(k, {}).setdefault(v, []).append(fid)
+            except TypeError:  # unhashable value: left to the slow path
+                pass
+
+    def _grow(self, n: int) -> None:
+        if n > self._cap:
+            cap = max(n, self._cap * 2)
+            new = np.full(cap, np.inf)
+            new[: self._cap] = self._del_np
+            self._del_np, self._cap = new, cap
 
     def __len__(self) -> int:
         return len(self.store)
@@ -128,14 +163,20 @@ class Memory:
                 t = max(now, last)
             frames.append(self.store.append(t, text, metas[i] if metas else None, vecs[i]))
             self.bm25.add(text)
+            self._index_meta(frames[-1].id, frames[-1].meta)
             last = t
+        self._grow(len(self.store))
         self.index.add(vecs)
+        if self.ann is not None:
+            self.ann.add(vecs)
         return frames
 
     @_writes
     def forget(self, fid: int, t: float | None = None) -> None:
         """Tombstone a frame: hidden from current search, kept for as_of queries."""
-        self.store.delete(fid, time.time() if t is None else t)
+        dt = time.time() if t is None else t
+        self.store.delete(fid, dt)
+        self._del_np[fid] = self.store.deleted[fid]
 
     @_writes
     def supersede(self, old_id: int, text: str, meta: dict | None = None,
@@ -144,6 +185,7 @@ class Memory:
         now = time.time() if t is None else t
         new = self.add(text, {**(meta or {}), "supersedes": old_id}, now)
         self.store.delete(old_id, new.t)
+        self._del_np[old_id] = self.store.deleted[old_id]
         return new
 
     # durability ---------------------------------------------------------------
@@ -155,8 +197,18 @@ class Memory:
     @_writes
     def checkpoint(self) -> None:
         """Persist BM25 + offsets so the next open replays only the tail."""
+        if self.ann is None and self.ann_threshold is not None and len(self.store) >= self.ann_threshold:
+            self.build_ann()
         self.store.write_checkpoint(self.bm25.to_arrays())
+        if self.ann is not None:
+            self.store.write_ann(self.ann.to_bytes(), len(self.ann))
         self.store.sync()
+
+    @_writes
+    def build_ann(self) -> None:
+        """Build the HNSW graph now (needs the 'ann' extra). It is then kept
+        up to date on every add and saved with each checkpoint."""
+        self.ann = AnnIndex.build(self.index.vectors)
 
     @_writes
     def compact(self, keep_history: bool = False) -> dict[str, int]:
@@ -171,7 +223,8 @@ class Memory:
         tmp = self.path.with_name(self.path.name + ".compact")
         if tmp.exists():
             tmp.unlink()
-        new = Memory(tmp, self.embedder, self.segment_size, self.approx, sync="never")
+        new = Memory(tmp, self.embedder, self.segment_size, self.approx,
+                     ann_threshold=self.ann_threshold, sync="never")
         vecs = self.index.vectors[keep] if keep else np.zeros((0, self.embedder.dim), np.float32)
         for k, old in enumerate(keep):
             f = s.get(old)
@@ -200,17 +253,21 @@ class Memory:
     def _mask(self, as_of: float | None, where: dict[str, Any] | None) -> np.ndarray:
         n = len(self.store)
         mask = np.ones(n, dtype=bool)
-        if as_of is not None:
+        d = self._del_np[:n]
+        if as_of is None:
+            mask &= ~np.isfinite(d)
+        else:
             mask[bisect.bisect_right(self.store.times, as_of) :] = False
-        for fid, dt in self.store.deleted.items():
-            if as_of is None or dt <= as_of:
-                mask[fid] = False
-        if where:
-            metas = self.store.metas
-            for i in np.flatnonzero(mask):
-                m = metas[i]
-                if any(m.get(k) != v for k, v in where.items()):
-                    mask[i] = False
+            mask &= ~(d <= as_of)
+        for k, v in (where or {}).items():
+            try:
+                ids = self._meta_ix.get(k, {}).get(v, ())
+            except TypeError:  # unhashable filter value: scan
+                ids = [i for i, m in enumerate(self.store.metas) if m.get(k) == v]
+            sel = np.zeros(n, dtype=bool)
+            if len(ids):
+                sel[np.asarray(ids, dtype=np.int64)] = True
+            mask &= sel
         return mask
 
     @_locked
@@ -225,6 +282,7 @@ class Memory:
         where: dict[str, Any] | None = None,
         recency_half_life: float | None = None,
         pool: int = 50,
+        exact: bool = False,
     ) -> list[Hit]:
         """Top-k frames. mode: hybrid | vector | lexical.
 
@@ -244,15 +302,17 @@ class Memory:
             if self.approx:
                 vec_hits = [(i, s) for i, s in self.index.search(q, pool * 4) if mask[i]][:pool]
             else:
-                scores = self.index.vectors @ q
-                scores[~mask] = -np.inf
-                top = min(pool, int(mask.sum()))
-                if top:
-                    idx = np.argpartition(-scores, top - 1)[:top]
-                    idx = idx[np.argsort(-scores[idx])]
-                    vec_hits = [(int(i), float(scores[i])) for i in idx]
+                visible = int(mask.sum())
+                if self.ann is not None and not exact and visible >= 0.5 * n and n > pool * 8:
+                    # ANN with over-fetch; if too many hits are masked, go exact
+                    fetch = min(n, pool * 4 + (n - visible) * 2)
+                    vec_hits = [(i, s) for i, s in self.ann.search(q, fetch) if mask[i]][:pool]
+                    if len(vec_hits) < min(pool, visible):
+                        vec_hits = self._exact_vec(q, mask, pool, visible)
+                else:
+                    vec_hits = self._exact_vec(q, mask, pool, visible)
         if mode in ("hybrid", "lexical"):
-            lex_hits = self.bm25.search(query, lambda f: bool(mask[f]), pool)
+            lex_hits = self.bm25.search(query, mask, pool)
         if mode == "vector":
             ranked = vec_hits
         elif mode == "lexical":
@@ -270,6 +330,16 @@ class Memory:
                       for f, s in ranked]
         ranked.sort(key=lambda x: -x[1])
         return [self._hit(fid, score, context, as_of) for fid, score in ranked[:k]]
+
+    def _exact_vec(self, q: np.ndarray, mask: np.ndarray, pool: int, visible: int):
+        scores = self.index.vectors @ q
+        scores[~mask] = -np.inf
+        top = min(pool, visible)
+        if not top:
+            return []
+        idx = np.argpartition(-scores, top - 1)[:top]
+        idx = idx[np.argsort(-scores[idx])]
+        return [(int(i), float(scores[i])) for i in idx]
 
     def _hit(self, fid: int, score: float, context: int, as_of: float | None) -> Hit:
         s = self.store
@@ -307,6 +377,7 @@ class Memory:
             "checkpoints": s.checkpoints,
             "frames_since_checkpoint": s.tail_records,
             "dropped_bytes_on_open": s.dropped_bytes,
+            "ann": self.ann is not None,
             "embedder": self.embedder.name,
             "dim": self.embedder.dim,
         }

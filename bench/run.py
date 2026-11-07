@@ -81,6 +81,8 @@ def run(n: int, shuffled: bool, llm_ms: float) -> None:
         build_pm,
         vecs.nbytes,
     )
+    t0 = time.perf_counter(); mem.build_ann(); b_ann = time.perf_counter() - t0
+    systems["pm-ann"] = (lambda q: [i for i, _ in mem.ann.search(q, K)], b_ann, vecs.nbytes * 1.15)
     systems["pm-centroid"] = (
         lambda q: [i for i, _ in approx.search(q, K)],
         0.0,
@@ -97,7 +99,7 @@ def run(n: int, shuffled: bool, llm_ms: float) -> None:
         print(f"{name:<12} {recall:>9.3f} {p50:>8.3f} {pct(lat, 95):>8.3f} {build:>8.2f} {nbytes/1e6:>7.1f} {100*p50/(p50+llm_ms):>13.3f}%")
 
     # full Memory.search path (embed text + search + fetch frames w/ context)
-    for mode in ("vector", "hybrid"):
+    for mode in ("vector", "hybrid", "lexical"):
         _, lat = timed(lambda q: mem.search(q, k=K, context=1, mode=mode), qtexts)
         print(f"{'pm '+mode+' API':<12} {'':>9} {pct(lat, 50):>8.3f} {pct(lat, 95):>8.3f}   (embed + search + fetch frames with +-1 context)")
 

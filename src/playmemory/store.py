@@ -24,6 +24,7 @@ _JLEN = struct.Struct("<I")
 REC_FRAME = 1
 REC_TOMBSTONE = 2
 REC_CHECKPOINT = 3  # derived index state; safe to ignore or drop (compaction)
+REC_ANN = 4  # serialized ANN graph: u64 frames covered | blob (derived, droppable)
 
 
 class ModelMismatchError(ValueError):
@@ -116,6 +117,7 @@ class FrameStore:
         self.dropped_bytes = 0
         self.checkpoints = 0
         self._cp_frames = 0  # frames covered by the last checkpoint
+        self._ann_loc: tuple[int, int] | None = None
         self._buf = bytearray()
         self._fd: int | None = None
         created = False
@@ -206,6 +208,7 @@ class FrameStore:
 
         # 1) hop the length chain to find the last checkpoint (no CRC work)
         cp = None
+        ann = None
         pos = pos0
         while pos + 5 <= size:
             (n,) = _LEN.unpack_from(data, pos)
@@ -214,7 +217,10 @@ class FrameStore:
                 break
             if data[pos + 4] == REC_CHECKPOINT:
                 cp = (pos, end)
+            elif data[pos + 4] == REC_ANN:
+                ann = (pos, end)
             pos = end
+        self._ann_loc = ann
 
         # 2) load it if its CRC holds, else fall back to a full scan
         start = pos0
@@ -375,6 +381,21 @@ class FrameStore:
         self._append_record(REC_CHECKPOINT, buf.getvalue())
         self._cp_frames = len(self._times)
         self.checkpoints += 1
+
+    def write_ann(self, blob: bytes, covered: int) -> None:
+        off = self._append_record(REC_ANN, struct.pack("<Q", covered) + blob)
+        self._ann_loc = (off, self._end)
+
+    def read_ann(self) -> tuple[int, bytes] | None:
+        """(frames covered, serialized graph) of the last intact ANN record."""
+        if self._ann_loc is None:
+            return None
+        pos, end = self._ann_loc
+        raw = self._read(pos, end - pos)
+        body = raw[4:-4]
+        if len(raw) != end - pos or zlib.crc32(body) != _CRC.unpack(raw[-4:])[0]:
+            return None
+        return struct.unpack_from("<Q", body, 1)[0], body[9:]
 
     def is_live(self, fid: int, as_of: float | None = None) -> bool:
         d = self.deleted.get(fid)
