@@ -21,10 +21,10 @@ import numpy as np
 from . import crypto
 from .store import (
     _CRC, _LEN, _TOMB, FLAG_VEC_F16, REC_ANN, REC_CHECKPOINT, REC_FRAME, REC_FRAME_Z,
-    REC_SIGNATURE, REC_TOMBSTONE, FrameStore, read_header, _fsync_dir,
+    REC_EVENT, REC_SIGNATURE, REC_TOMBSTONE, FrameStore, read_header, _fsync_dir,
 )
 
-_KNOWN = (REC_FRAME, REC_TOMBSTONE, REC_CHECKPOINT, REC_ANN, REC_FRAME_Z, REC_SIGNATURE)
+_KNOWN = (REC_FRAME, REC_TOMBSTONE, REC_CHECKPOINT, REC_ANN, REC_FRAME_Z, REC_SIGNATURE, REC_EVENT)
 _WINDOW = 1 << 24
 _POINTER_KEYS = ("supersedes", "source")
 
@@ -63,7 +63,7 @@ def _next_valid(data, start: int, size: int) -> int | None:
     while pos < size:
         hi = min(pos + _WINDOW, size)
         types = arr[pos + 4 : hi + 4 if hi + 4 <= size else size]
-        cand = np.flatnonzero((types >= 1) & (types <= 6)) + pos
+        cand = np.flatnonzero((types >= 1) & (types <= 7)) + pos
         for c in cand.tolist():
             if _try(data, c, size) is not None:  # length + type + CRC32 all check out
                 return c

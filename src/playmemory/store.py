@@ -22,6 +22,7 @@ READ_VERSIONS = (2, 3)
 FLAG_VEC_F16 = 1  # vectors stored as float16 (half the size), read back as float32
 FLAG_ENCRYPTED = 2  # record payloads are AES-GCM sealed; header carries a KDF block
 REC_SIGNATURE = 6  # HMAC-SHA256 over every byte before this record
+REC_EVENT = 7  # session/audit event (JSON); never affects frame ids
 Z_MIN_JSON = 200  # don't bother compressing tiny records
 _HDR = struct.Struct("<4sHHH")  # magic, version, dim, name_len
 _SPEC = struct.Struct("<H")
@@ -186,6 +187,7 @@ class FrameStore:
         self._set_vec_dtype()
         self._offsets: list[int] = []
         self._voffs: list[int] = []
+        self._event_offs: list[int] = []
         self._times: list[float] = []
         self.metas: list[dict] = []
         self.deleted: dict[int, float] = {}
@@ -404,12 +406,15 @@ class FrameStore:
             elif rtype == REC_TOMBSTONE:
                 fid, t = _TOMB.unpack(body[1:])
                 self.deleted[fid] = t
-            # checkpoint / ann records carry no frame state here
+            elif rtype == REC_EVENT:
+                self._event_offs.append(pos)
+            # checkpoint / ann / signature records carry no frame state here
             pos = end
         return pos
 
     def _reset_state(self) -> None:
         self._offsets, self._voffs, self._times, self.metas = [], [], [], []
+        self._event_offs = []
         self.deleted = {}
         self.checkpoint_arrays = None
         self.tail_texts = []
@@ -427,6 +432,7 @@ class FrameStore:
             raise CorruptFileError("inconsistent checkpoint")
         self._offsets = arrays["offsets"].tolist()
         self._voffs = arrays["voffs"].tolist()
+        self._event_offs = arrays["ev_offs"].tolist() if "ev_offs" in arrays else []
         self._times = arrays["times"].tolist()
         self.metas = json.loads(arrays["metas"].tobytes())
         self.deleted = dict(zip(arrays["del_ids"].tolist(), arrays["del_t"].tolist()))
@@ -558,6 +564,7 @@ class FrameStore:
         arrays = {
             "offsets": np.asarray(self._offsets, dtype=np.int64),
             "voffs": np.asarray(self._voffs, dtype=np.int64),
+            "ev_offs": np.asarray(self._event_offs, dtype=np.int64),
             "times": np.asarray(self._times, dtype=np.float64),
             "metas": np.frombuffer(json.dumps(self.metas, separators=(",", ":")).encode(), np.uint8),
             "del_ids": np.asarray(list(self.deleted), dtype=np.int64),
@@ -569,6 +576,17 @@ class FrameStore:
         self._append_record(REC_CHECKPOINT, buf.getvalue())
         self._cp_frames = len(self._times)
         self.checkpoints += 1
+
+    def append_event(self, event: dict) -> None:
+        off = self._append_record(REC_EVENT, json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode())
+        self._event_offs.append(off)
+
+    def events(self):
+        """Yield every recorded event dict in file order."""
+        for off in self._event_offs:
+            head = self._read(off, 5)
+            (n,) = _LEN.unpack_from(head)
+            yield json.loads(self._plain(head[4], self._read(off + 5, n - 1), off))
 
     def write_ann(self, blob: bytes, covered: int) -> None:
         off = self._append_record(REC_ANN, struct.pack("<Q", covered) + blob)

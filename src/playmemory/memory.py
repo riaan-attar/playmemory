@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
 import dataclasses
 import functools
+import uuid
 import os
 import threading
 import time
@@ -49,6 +51,30 @@ def _writes(fn):
             return fn(self, *a, **kw)
 
     return wrapper
+
+
+@dataclasses.dataclass
+class ReplayDiff:
+    event: dict
+    original: list
+    replayed: list
+
+    @property
+    def same(self) -> bool:
+        return self.original == self.replayed
+
+    @property
+    def added(self) -> list:
+        return [x for x in self.replayed if x not in self.original]
+
+    @property
+    def removed(self) -> list:
+        return [x for x in self.original if x not in self.replayed]
+
+    @property
+    def reordered(self) -> bool:
+        common = [x for x in self.original if x in self.replayed]
+        return common != [x for x in self.replayed if x in self.original]
 
 
 class Memory:
@@ -98,6 +124,10 @@ class Memory:
         self.read_only = read_only
         if vec_dtype not in ("float32", "float16"):
             raise ValueError("vec_dtype must be float32 or float16")
+        self._session: dict | None = None
+        self._seq = 0
+        self._snapshot: tuple[int, int] | None = None  # (frames, tombstones) visible during replay
+        self._replaying = False
         self._password = password
         self.principal = principal
         self.redact = redact
@@ -192,7 +222,9 @@ class Memory:
         vecs = self.embedder.embed(texts) if vectors is None else np.asarray(vectors, dtype=np.float32)
         if vecs.shape != (len(texts), self.embedder.dim):
             raise ValueError(f"vectors must have shape ({len(texts)}, {self.embedder.dim})")
-        return self._append(texts, metas, times, vecs)
+        frames = self._append(texts, metas, times, vecs)
+        self._log("add", {"count": len(frames)}, [f.id for f in frames])
+        return frames
 
     def _append(self, texts, metas, times, vecs) -> list[Frame]:
         now = time.time()
@@ -232,6 +264,7 @@ class Memory:
         dt = time.time() if t is None else t
         self.store.delete(fid, dt)
         self._del_np[fid] = self.store.deleted[fid]
+        self._log("forget", {}, [fid])
 
     @_writes
     def supersede(self, old_id: int, text: str, meta: dict | None = None,
@@ -250,6 +283,91 @@ class Memory:
         from .ingest import ingest_paths
 
         return ingest_paths(self, paths, **kw)
+
+    # sessions: audit trail + deterministic replay ----------------------------------
+    def _log(self, op: str, params: dict, result) -> None:
+        if self._session is None or self._replaying or self.read_only:
+            return
+        who = None
+        if self.principal is not None:
+            who = {"tenant": self.principal.tenant, "roles": sorted(self.principal.roles)}
+        self._seq += 1
+        self.store.append_event({"s": self._session["id"], "q": self._seq, "op": op, "t": time.time(),
+                                 "n": len(self.store), "nt": len(self.store.deleted), "who": who,
+                                 "p": params, "r": result})
+
+    @contextlib.contextmanager
+    def session(self, name: str = "session"):
+        """Record every search/span/add/forget inside the block into the file, with its
+        parameters and results. Replay them later with `replay(session_id, **overrides)`."""
+        sid = self.start_session(name)
+        try:
+            yield sid
+        finally:
+            self.end_session()
+
+    @_writes
+    def start_session(self, name: str = "session") -> str:
+        if self._session is not None:
+            raise RuntimeError("a session is already recording")
+        sid = uuid.uuid4().hex[:10]
+        self._session, self._seq = {"id": sid, "name": name}, 0
+        self._log("session_start", {"name": name}, None)
+        return sid
+
+    @_writes
+    def end_session(self) -> None:
+        if self._session is not None:
+            self._log("session_end", {}, None)
+            self._session = None
+
+    @_locked
+    def events(self, session_id: str | None = None) -> list[dict]:
+        return [e for e in self.store.events() if session_id is None or e["s"] == session_id]
+
+    @_locked
+    def sessions(self) -> list[dict]:
+        out: dict[str, dict] = {}
+        for e in self.store.events():
+            d = out.setdefault(e["s"], {"id": e["s"], "name": "", "t": e["t"], "events": 0})
+            d["events"] += 1
+            if e["op"] == "session_start":
+                d["name"] = e["p"]["name"]
+        return list(out.values())
+
+    @_locked
+    def replay(self, session_id: str, **overrides) -> list["ReplayDiff"]:
+        """Re-run the recorded searches/spans of a session against the memory exactly as it was
+        when each was issued (later frames/deletions hidden) and diff the results. `overrides`
+        replace search parameters (mode=..., k=..., rerank=..., graph=...) so you can ask "what
+        would a different setting have returned?"."""
+        diffs = []
+        self._replaying = True
+        try:
+            for e in self.store.events():
+                if e["s"] != session_id or e["op"] not in ("search", "recall_span"):
+                    continue
+                params = {**e["p"], **overrides}
+                params.pop("rerank", None) if "rerank" not in overrides else None
+                params.pop("graph", None) if "graph" not in overrides else None
+                if params.get("when") is not None and params.get("now") is None:
+                    params["now"] = e["t"]
+                if isinstance(params.get("when"), list):
+                    params["when"] = tuple(params["when"])
+                if isinstance(params.get("cutoff"), list):
+                    params["cutoff"] = tuple(params["cutoff"])
+                self._snapshot = (e["n"], e["nt"])
+                if e["op"] == "search":
+                    got = [[h.frame.id, round(h.score, 5)] for h in self.search(**params)]
+                    old, new = [r[0] for r in e["r"]], [r[0] for r in got]
+                else:
+                    got = [[sp.start_id, sp.end_id] for sp in self.recall_span(**params)]
+                    old, new = [tuple(r) for r in e["r"]], [tuple(r) for r in got]
+                diffs.append(ReplayDiff(e, old, new))
+        finally:
+            self._snapshot = None
+            self._replaying = False
+        return diffs
 
     # multi-process reads -------------------------------------------------------
     def _refresh_impl(self) -> int:
@@ -347,6 +465,8 @@ class Memory:
         if keep_history:
             for old, dt in s.deleted.items():
                 new.store.delete(remap[old], dt)
+            for ev in s.events():  # ids are unchanged when history is kept, so the audit trail stays valid
+                new.store.append_event(ev)
         new.checkpoint()
         new.store.close()
         s.close()
@@ -370,6 +490,12 @@ class Memory:
             mask[:lo] = False
             mask[hi:] = False
         d = self._del_np[:n]
+        if self._snapshot is not None:  # replay: the world as it was when the event was recorded
+            n_snap, n_tomb = self._snapshot
+            mask[n_snap:] = False
+            d = np.full(n, np.inf)
+            for fid, dt in list(self.store.deleted.items())[:n_tomb]:
+                d[fid] = dt
         if as_of is None:
             mask &= ~np.isfinite(d)
         else:
@@ -423,7 +549,15 @@ class Memory:
         if cutoff is not None:
             ranked = ranked[: keep_count([sc for _, sc in ranked[:k]], cutoff)]
         vis = self._mask(as_of, None, None, principal) if context else None
-        return [self._hit(fid, score, context, as_of, vis) for fid, score in ranked[:k]]
+        hits = [self._hit(fid, score, context, as_of, vis) for fid, score in ranked[:k]]
+        if self._session is not None and not self._replaying:
+            self._log("search", {"query": query, "k": k, "context": context, "mode": mode, "as_of": as_of,
+                                 "where": where, "recency_half_life": recency_half_life, "pool": pool,
+                                 "exact": exact, "when": when if isinstance(when, (str, type(None))) else list(when),
+                                 "now": now, "cutoff": cutoff, "rerank": getattr(rerank, "name", bool(rerank)) if rerank else None,
+                                 "graph": graph is not None},
+                      [[h.frame.id, round(h.score, 5)] for h in hits])
+        return hits
 
     def _rank(self, query: str, mode: str, as_of: float | None, where: dict[str, Any] | None,
               recency_half_life: float | None, pool: int, exact: bool, *,
@@ -465,7 +599,8 @@ class Memory:
                     fused[fid] = fused.get(fid, 0.0) + 1.0 / (RRF_K + rank + 1)
             ranked = list(fused.items())
         if recency_half_life:
-            ref = as_of if as_of is not None else self.store.times[-1]
+            last = self._snapshot[0] if self._snapshot else len(self.store)
+            ref = as_of if as_of is not None else self.store.times[max(last, 1) - 1]
             times = self.store.times
             ranked = [(f, s * 0.5 ** (max(ref - times[f], 0) / recency_half_life))
                       for f, s in ranked]
@@ -598,6 +733,11 @@ class Memory:
             spans.append(Span(lo, hi, frames[0].t, frames[-1].t, frames, ep_score[e], e, int(vis[s:end].sum()),
                               self._keywords(frames)))
         spans.sort(key=lambda sp: sp.start_id)
+        if self._session is not None and not self._replaying:
+            self._log("recall_span", {"query": query, "k": k, "budget_chars": budget_chars, "mode": mode,
+                                    "as_of": as_of, "where": where, "pool": pool,
+                                    "when": when if isinstance(when, (str, type(None))) else list(when), "now": now},
+                      [[sp.start_id, sp.end_id] for sp in spans])
         return spans
 
     def _grow_span(self, s: int, end: int, hits: dict[int, float], vis: np.ndarray,
