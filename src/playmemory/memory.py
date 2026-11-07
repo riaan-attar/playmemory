@@ -215,6 +215,14 @@ class Memory:
         self._del_np[old_id] = self.store.deleted[old_id]
         return new
 
+    @_writes
+    def ingest(self, paths, **kw):
+        """Chunk and add files/directories (txt, md, html, csv, json/jsonl; pdf, docx, xlsx,
+        pptx with the `docs` extra). Idempotent per file content. See playmemory.ingest."""
+        from .ingest import ingest_paths
+
+        return ingest_paths(self, paths, **kw)
+
     # multi-process reads -------------------------------------------------------
     def _refresh_impl(self) -> int:
         try:
@@ -632,3 +640,4 @@ class Memory:
 
     def __exit__(self, *exc) -> None:
         self.close()
+

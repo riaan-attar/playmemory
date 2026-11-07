@@ -117,7 +117,14 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("checkpoint")
     c = sub.add_parser("compact"); c.add_argument("--keep-history", action="store_true")
     sub.add_parser("export", help="dump all frames as JSONL")
-    sub.add_parser("serve", help="run an MCP server on stdio")
+    ig = sub.add_parser("ingest", help="chunk and add files / directories")
+    ig.add_argument("paths", nargs="+")
+    ig.add_argument("--max-chars", type=int, default=800)
+    ig.add_argument("--overlap", type=int, default=100)
+    ig.add_argument("--append", action="store_true", help="re-add changed files instead of replacing their old chunks")
+    sv = sub.add_parser("serve", help="run an MCP server on stdio")
+    sv.add_argument("--ingest-root", action="append", default=[],
+                    help="allow the MCP `ingest` tool to read files under this directory (repeatable)")
     args = ap.parse_args(argv)
 
     with warnings.catch_warnings():
@@ -156,6 +163,15 @@ def main(argv: list[str] | None = None) -> int:
                     d["before"] = [_frame_dict(x) for x in h.before]
                     d["after"] = [_frame_dict(x) for x in h.after]
                 _print(d)
+        elif args.cmd == "ingest":
+            from dataclasses import asdict
+
+            rep = m.ingest(args.paths, max_chars=args.max_chars, overlap=args.overlap,
+                           on_change="append" if args.append else "replace")
+            m.commit()
+            d = asdict(rep)
+            d.pop("frame_ids")
+            _print(d)
         elif args.cmd == "ask":
             ans = m.ask(args.question, _synth(args.llm), k=args.k, budget_chars=args.budget,
                         spans=args.spans, when=args.when)
@@ -191,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "serve":
             from .server import MemoryServer
 
-            MemoryServer(m).serve()
+            MemoryServer(m, ingest_roots=args.ingest_root).serve()
         elif args.cmd == "export":
             for i in range(len(m)):
                 fr = m.get(i)

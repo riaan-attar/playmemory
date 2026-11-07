@@ -21,7 +21,7 @@ from collections import defaultdict
 import numpy as np
 
 from bench.quality import CATS, load_turns
-from playmemory import EpisodeConfig, Memory, from_spec
+from playmemory import EpisodeConfig, Memory, OnnxCrossEncoder, from_spec
 
 
 class CachedEmbedder:
@@ -36,6 +36,20 @@ class CachedEmbedder:
             for t, v in zip(miss, self.inner.embed(miss)):
                 self.cache[t] = v
         return np.vstack([self.cache[t] for t in texts])
+
+
+class CachedReranker:
+    """Memoise (query, passage) scores: the same pairs recur across budgets/systems."""
+
+    def __init__(self, inner):
+        self.inner, self.cache = inner, {}
+
+    def score(self, query, passages):
+        miss = [p for p in dict.fromkeys(passages) if (query, p) not in self.cache]
+        if miss:
+            for p, v in zip(miss, self.inner.score(query, miss)):
+                self.cache[(query, p)] = v
+        return [self.cache[(query, p)] for p in passages]
 
 
 def pack_chunks(hits, budget, context):
@@ -57,7 +71,7 @@ def pack_chunks(hits, budget, context):
     return got
 
 
-def run(data, embedder, budgets, limit, cfg):
+def run(data, embedder, budgets, limit, cfg, rr=None):
     rows = defaultdict(list)
     sizes = defaultdict(list)
     for sample in data[:limit]:
@@ -77,13 +91,20 @@ def run(data, embedder, budgets, limit, cfg):
                 continue
             q = qa["question"]
             hits = mem.search(q, k=50, context=1, mode="hybrid")
+            hits_rr = mem.search(q, k=50, context=1, mode="hybrid", rerank=rr, rerank_pool=30) if rr else None
             for B in budgets:
                 got = {
                     "chunks": pack_chunks(hits, B, False),
                     "chunks+ctx": pack_chunks(hits, B, True),
                     "span1": {f.id for sp in mem.recall_span(q, 1, B) for f in sp.frames},
                     "span2": {f.id for sp in mem.recall_span(q, 2, B) for f in sp.frames},
+                    "span3": {f.id for sp in mem.recall_span(q, 3, B) for f in sp.frames},
                 }
+                if rr:
+                    got["chunks+rr"] = pack_chunks(hits_rr, B, False)
+                    for kk in (1, 2, 3):
+                        got[f"span{kk}+rr"] = {f.id for sp in mem.recall_span(q, kk, B, rerank=rr, rerank_pool=30)
+                                               for f in sp.frames}
                 for name, ids in got.items():
                     frac = len(gold & ids) / len(gold)
                     for g in ("all", CATS[qa["category"]]):
@@ -102,13 +123,17 @@ def main():
     ap.add_argument("--budgets", type=int, nargs="+", default=[500, 1000, 2000, 4000])
     ap.add_argument("--alpha", type=float, default=0.5)
     ap.add_argument("--max-len", type=int, default=40)
+    ap.add_argument("--rerank", action="store_true", help="also evaluate the ONNX cross-encoder reranker")
     args = ap.parse_args()
     data = json.load(open(args.data))
     emb = CachedEmbedder(from_spec(args.embedder))
     cfg = EpisodeConfig(alpha=args.alpha, max_len=args.max_len, boundary_key="session")
     t0 = time.perf_counter()
-    rows, sizes = run(data, emb, args.budgets, args.limit, cfg)
-    systems = ["chunks", "chunks+ctx", "span1", "span2"]
+    rr = CachedReranker(OnnxCrossEncoder()) if args.rerank else None
+    rows, sizes = run(data, emb, args.budgets, args.limit, cfg, rr)
+    systems = ["chunks", "chunks+ctx", "span1", "span2", "span3"]
+    if rr:
+        systems += ["chunks+rr", "span1+rr", "span2+rr", "span3+rr"]
     n = len(rows[("chunks", args.budgets[0], "all", "recall")])
     print(f"\nLoCoMo budget-matched retrieval, embedder={emb.name}, questions={n} ({time.perf_counter()-t0:.0f}s)")
     for metric, title in (("recall", "evidence-recall"), ("hit", "hit (all gold turns returned)")):

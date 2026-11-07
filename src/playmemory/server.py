@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sys
+from pathlib import Path
 from typing import Any, TextIO
 
 from .cards import Extractor, RuleExtractor, profile, remember
@@ -53,9 +54,16 @@ def _tools() -> list[dict]:
     ]
 
 
+_INGEST_TOOL = {"name": "ingest", "description": "Chunk and add a file or directory (txt, md, html, csv, json, pdf, docx, xlsx, pptx) to memory. "
+                "Only paths under the server's allowed roots are readable.",
+                "inputSchema": {"type": "object", "required": ["path"], "properties": {
+                    "path": {"type": "string"}, "max_chars": {"type": "integer"}}}}
+
+
 class MemoryServer:
-    def __init__(self, memory: Memory, extractor: Extractor | None = None):
+    def __init__(self, memory: Memory, extractor: Extractor | None = None, ingest_roots: list[str] | None = None):
         self.mem = memory
+        self.ingest_roots = [Path(r).resolve() for r in (ingest_roots or [])]
         self.extractor = extractor or RuleExtractor()
 
     # tool dispatch --------------------------------------------------------------
@@ -95,6 +103,19 @@ class MemoryServer:
             return [_frame(f) for f in m.window(a["t0"], a["t1"])]
         if name == "profile":
             return profile(m, a.get("subject", "user"), a.get("as_of"))
+        if name == "ingest":
+            if not self.ingest_roots:
+                raise PermissionError("ingest is disabled: start the server with --ingest-root DIR")
+            target = Path(a["path"]).expanduser().resolve()
+            if not any(target == r or r in target.parents for r in self.ingest_roots):
+                raise PermissionError(f"{target} is outside the allowed ingest roots")
+            from dataclasses import asdict
+
+            rep = m.ingest(str(target), max_chars=a.get("max_chars", 800))
+            m.commit()
+            d = asdict(rep)
+            d.pop("frame_ids")
+            return d
         if name == "stats":
             return m.stats()
         raise KeyError(f"unknown tool {name!r}")
@@ -111,7 +132,7 @@ class MemoryServer:
             elif method == "ping":
                 result = {}
             elif method == "tools/list":
-                result = {"tools": _tools()}
+                result = {"tools": _tools() + ([_INGEST_TOOL] if self.ingest_roots else [])}
             elif method == "tools/call":
                 p = msg.get("params", {})
                 try:
