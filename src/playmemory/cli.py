@@ -148,6 +148,11 @@ def main(argv: list[str] | None = None) -> int:
     ig.add_argument("--transcribe", metavar="MODEL", help="transcribe audio/video with faster-whisper (e.g. base)")
     ig.add_argument("--append", action="store_true", help="re-add changed files instead of replacing their old chunks")
     sv = sub.add_parser("serve", help="run an MCP server on stdio")
+    sv.add_argument("--tenant", help="serve as this tenant: only frames with meta.tenant == TENANT are visible")
+    sv.add_argument("--role", action="append", default=[], help="role granted to the principal (repeatable)")
+    sv.add_argument("--group", action="append", default=[], help="group granted to the principal (repeatable)")
+    sv.add_argument("--allow-untenanted", action="store_true", help="also expose frames with no tenant")
+    sv.add_argument("--redact", action="store_true", help="mask emails/phones/cards/SSNs/IPs in returned text")
     sv.add_argument("--ingest-root", action="append", default=[],
                     help="allow the MCP `ingest` tool to read files under this directory (repeatable)")
     args = ap.parse_args(argv)
@@ -235,6 +240,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "serve":
             from .server import MemoryServer
 
+            if args.tenant is not None:
+                from .acl import Principal
+
+                m.principal = Principal(args.tenant, frozenset(args.role), frozenset(args.group), args.allow_untenanted)
+            m.redact = args.redact
             MemoryServer(m, ingest_roots=args.ingest_root).serve()
         elif args.cmd == "export":
             for i in range(len(m)):

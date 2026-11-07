@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import dataclasses
 import functools
 import os
 import threading
@@ -10,6 +11,8 @@ from typing import Any
 
 import numpy as np
 
+from . import acl as _acl
+from .acl import Principal
 from .ann import AnnIndex
 from .cutoff import keep_count
 from .embed import Embedder, HashEmbedder, from_spec
@@ -17,6 +20,7 @@ from .episodes import EpisodeConfig, EpisodeIndex
 from .frame import Frame, Hit, Span
 from .index import VectorMatrix
 from .lexical import TOKENIZER_VERSION, BM25Index, tokenize
+from .pii import mask_pii
 from .temporal import parse_time_range
 from .store import FLAG_VEC_F16, FileChangedError, FrameStore, _fsync_dir, read_header
 
@@ -70,6 +74,8 @@ class Memory:
         vec_dtype: str = "float32",
         auto_refresh: bool = False,
         password: str | bytes | None = None,
+        principal: Principal | None = None,
+        redact: bool | Any = False,
         max_text_bytes: int = MAX_TEXT_BYTES,
         max_meta_bytes: int = MAX_META_BYTES,
     ):
@@ -93,6 +99,8 @@ class Memory:
         if vec_dtype not in ("float32", "float16"):
             raise ValueError("vec_dtype must be float32 or float16")
         self._password = password
+        self.principal = principal
+        self.redact = redact
         self._flags = FLAG_VEC_F16 if vec_dtype == "float16" else 0
         self.auto_refresh = auto_refresh and read_only
         self.ann_threshold = ann_threshold
@@ -349,9 +357,13 @@ class Memory:
 
     # reading ------------------------------------------------------------------
     def _mask(self, as_of: float | None, where: dict[str, Any] | None,
-              window: tuple[float, float] | None = None) -> np.ndarray:
+              window: tuple[float, float] | None = None,
+              principal: Principal | None = None) -> np.ndarray:
         n = len(self.store)
         mask = np.ones(n, dtype=bool)
+        principal = principal or self.principal
+        if principal is not None:
+            mask &= self._acl_mask(principal, n)
         if window is not None:  # keep frames with window[0] <= t < window[1]
             lo = bisect.bisect_left(self.store.times, window[0])
             hi = bisect.bisect_left(self.store.times, window[1])
@@ -392,6 +404,7 @@ class Memory:
         rerank: Any = None,
         rerank_pool: int = 30,
         cutoff: Any = None,
+        principal: Principal | None = None,
     ) -> list[Hit]:
         """Top-k frames. mode: hybrid | vector | lexical.
 
@@ -404,21 +417,22 @@ class Memory:
         cutoff: adaptive result count, see playmemory.cutoff ("elbow", ("ratio", .5), ...).
         """
         ranked = self._rank(query, mode, as_of, where, recency_half_life, pool, exact,
-                            when=when, now=now, rerank=rerank, rerank_pool=rerank_pool)
+                            when=when, now=now, rerank=rerank, rerank_pool=rerank_pool, principal=principal)
         if cutoff is not None:
             ranked = ranked[: keep_count([sc for _, sc in ranked[:k]], cutoff)]
-        return [self._hit(fid, score, context, as_of) for fid, score in ranked[:k]]
+        vis = self._mask(as_of, None, None, principal) if context else None
+        return [self._hit(fid, score, context, as_of, vis) for fid, score in ranked[:k]]
 
     def _rank(self, query: str, mode: str, as_of: float | None, where: dict[str, Any] | None,
               recency_half_life: float | None, pool: int, exact: bool, *,
               when=None, now: float | None = None, rerank=None,
-              rerank_pool: int = 30) -> list[tuple[int, float]]:
+              rerank_pool: int = 30, principal=None) -> list[tuple[int, float]]:
         """Ranked (frame id, score) candidates, best first, at most ~pool of them."""
         n = len(self.store)
         if n == 0:
             return []
         window = self._window(when, query, now)
-        mask = self._mask(as_of, where, window)
+        mask = self._mask(as_of, where, window, principal)
         ranked: list[tuple[int, float]]
         vec_hits: list[tuple[int, float]] = []
         lex_hits: list[tuple[int, float]] = []
@@ -459,6 +473,29 @@ class Memory:
             ranked = head + [(f, min(sc, floor) - 1e-6 * (i + 1)) for i, (f, sc) in enumerate(tail)]
         return ranked
 
+    def _acl_mask(self, p: Principal, n: int) -> np.ndarray:
+        ix = self._meta_ix
+        tenanted = np.zeros(n, dtype=bool)
+        for ids in ix.get(_acl.TENANT, {}).values():
+            tenanted[np.asarray(ids, dtype=np.int64)] = True
+        ok = np.zeros(n, dtype=bool)
+        mine = ix.get(_acl.TENANT, {}).get(p.tenant, ())
+        if len(mine):
+            ok[np.asarray(mine, dtype=np.int64)] = True
+        if p.allow_untenanted:
+            ok |= ~tenanted
+        for fid in ix.get(_acl.VISIBILITY, {}).get("restricted", ()):  # usually a small set
+            if ok[fid]:
+                ok[fid] = _acl.allowed(p, self.store.metas[fid] or {})
+        return ok
+
+    def _red(self, f: Frame) -> Frame:
+        """Query-time PII masking of returned text (stored text is untouched)."""
+        if not self.redact:
+            return f
+        fn = self.redact if callable(self.redact) else mask_pii
+        return dataclasses.replace(f, text=fn(f.text))
+
     def _window(self, when, query: str, now: float | None):
         if when is None:
             return None
@@ -477,13 +514,25 @@ class Memory:
         idx = idx[np.argsort(-scores[idx])]
         return [(int(i), float(scores[i])) for i in idx]
 
-    def _hit(self, fid: int, score: float, context: int, as_of: float | None) -> Hit:
+    def _hit(self, fid: int, score: float, context: int, as_of: float | None, vis=None) -> Hit:
         s = self.store
-        before = s.range(fid - context, fid, True, as_of) if context else []
-        after = s.range(fid + 1, fid + 1 + context, True, as_of) if context else []
-        if as_of is not None:
-            after = [f for f in after if f.t <= as_of]
-        return Hit(s.get(fid), score, tuple(before), tuple(after))
+        if vis is None:
+            vis = self._mask(as_of, None) if context else None
+        before: list[Frame] = []
+        after: list[Frame] = []
+        if context:  # walk outward collecting `context` VISIBLE neighbours per side
+            i = fid - 1
+            while i >= 0 and len(before) < context:
+                if vis[i]:
+                    before.append(s.get(i))
+                i -= 1
+            before.reverse()
+            i, n = fid + 1, len(s)
+            while i < n and len(after) < context:
+                if vis[i]:
+                    after.append(s.get(i))
+                i += 1
+        return Hit(self._red(s.get(fid)), score, tuple(map(self._red, before)), tuple(map(self._red, after)))
 
     def _sync_episodes(self) -> None:
         if len(self.store) != getattr(self.episodes, "_n", -1) or not len(self.episodes):
@@ -496,16 +545,18 @@ class Memory:
         return [(a, b - 1) for a, b in self.episodes.bounds()]
 
     @_locked
-    def read(self, start_id: int, end_id: int, as_of: float | None = None) -> list[Frame]:
+    def read(self, start_id: int, end_id: int, as_of: float | None = None,
+             principal: Principal | None = None) -> list[Frame]:
         """The frames of a span pointer (inclusive ids), minus forgotten/future ones."""
-        return self.store.range(start_id, end_id + 1, True, as_of)
+        vis = self._mask(as_of, None, None, principal)
+        return [self._red(f) for f in self.store.range(start_id, end_id + 1, True, as_of) if vis[f.id]]
 
     @_locked
     def recall_span(self, query: str, k: int = 1, budget_chars: int = 4000, *,
                     mode: str = "hybrid", as_of: float | None = None,
                     where: dict[str, Any] | None = None, pool: int = 50,
                     when=None, now: float | None = None, rerank: Any = None,
-                    rerank_pool: int = 30) -> list[Span]:
+                    rerank_pool: int = 30, principal: Principal | None = None) -> list[Span]:
         """Return up to k contiguous timeline spans ("watch from A to B") that
         best cover the query, each trimmed to its share of budget_chars.
 
@@ -516,7 +567,7 @@ class Memory:
             return []
         self._sync_episodes()
         ranked = self._rank(query, mode, as_of, where, None, pool, False,
-                            when=when, now=now, rerank=rerank, rerank_pool=rerank_pool)
+                            when=when, now=now, rerank=rerank, rerank_pool=rerank_pool, principal=principal)
         if not ranked:
             return []
         fids = np.array([f for f, _ in ranked])
@@ -529,17 +580,17 @@ class Memory:
         ep_score = {e: max(h.values()) + 1e-3 * sum(h.values()) for e, h in ep_hits.items()}
         top = sorted(ep_score, key=lambda e: -ep_score[e])[:k]
         per = max(budget_chars // max(len(top), 1), 1)
-        vis = self._mask(as_of, None, self._window(when, query, now))  # spans stay inside `when`
+        vis = self._mask(as_of, None, self._window(when, query, now), principal)  # spans stay inside `when` + ACL
         q = self.embedder.embed([query])[0]
         bounds = self.episodes.bounds()
         spans: list[Span] = []
         for e in top:
             s, end = bounds[e]  # [s, end)
             lo, hi = self._grow_span(s, end, ep_hits[e], vis, q, per)
-            frames = tuple(f for f in self.store.range(lo, hi + 1, True, as_of) if vis[f.id])
+            frames = tuple(self._red(f) for f in self.store.range(lo, hi + 1, True, as_of) if vis[f.id])
             if not frames:
                 continue
-            spans.append(Span(lo, hi, frames[0].t, frames[-1].t, frames, ep_score[e], e, end - s,
+            spans.append(Span(lo, hi, frames[0].t, frames[-1].t, frames, ep_score[e], e, int(vis[s:end].sum()),
                               self._keywords(frames)))
         spans.sort(key=lambda sp: sp.start_id)
         return spans
@@ -587,29 +638,34 @@ class Memory:
 
     @_locked
     def find(self, where: dict[str, Any], limit: int | None = None,
-             as_of: float | None = None) -> list[Frame]:
+             as_of: float | None = None, principal: Principal | None = None) -> list[Frame]:
         """Live frames whose meta matches `where`, in timeline order."""
-        ids = np.flatnonzero(self._mask(as_of, where))
+        ids = np.flatnonzero(self._mask(as_of, where, None, principal))
         if limit is not None:
             ids = ids[-limit:]
-        return [self.store.get(int(i)) for i in ids]
+        return [self._red(self.store.get(int(i))) for i in ids]
 
     @_locked
-    def get(self, fid: int) -> Frame:
-        return self.store.get(fid)
+    def get(self, fid: int, principal: Principal | None = None) -> Frame:
+        p = principal or self.principal
+        if p is not None and not self._acl_mask(p, len(self.store))[fid]:
+            raise PermissionError(f"frame {fid} is not visible to this principal")
+        return self._red(self.store.get(fid))
 
     @_locked
     def seek(self, t: float) -> Frame | None:
         """The live frame in effect at time t (last live frame with time <= t)."""
         i = self.store.seek_time(t)
-        while i is not None and i >= 0 and not self.store.is_live(i, t):
+        vis = self._mask(t, None, None, None) if self.principal is not None else None
+        while i is not None and i >= 0 and not (self.store.is_live(i, t) and (vis is None or vis[i])):
             i -= 1
-        return None if i is None or i < 0 else self.store.get(i)
+        return None if i is None or i < 0 else self._red(self.store.get(i))
 
     @_locked
     def window(self, t0: float, t1: float) -> list[Frame]:
         lo, hi = self.store.time_range(t0, t1)
-        return self.store.range(lo, hi, True)
+        vis = self._mask(None, None, None, None) if self.principal is not None else None
+        return [self._red(f) for f in self.store.range(lo, hi, True) if vis is None or vis[f.id]]
 
     def ask(self, question: str, synthesizer, *, k: int = 8, context: int = 1,
             budget_chars: int = 6000, spans: bool = False, **search_kw):
