@@ -405,6 +405,7 @@ class Memory:
         rerank_pool: int = 30,
         cutoff: Any = None,
         principal: Principal | None = None,
+        graph: Any = None,
     ) -> list[Hit]:
         """Top-k frames. mode: hybrid | vector | lexical.
 
@@ -414,10 +415,11 @@ class Memory:
         when: restrict to a time range: (t0, t1), a phrase like "last week" / "in May 2023",
         or "auto" to read one out of the query itself (relative to `now`, default wall clock).
         rerank: a Reranker rescoring the top `rerank_pool` candidates.
+        graph: a playmemory.graph.Graph; frames about entities named in the query join the fusion.
         cutoff: adaptive result count, see playmemory.cutoff ("elbow", ("ratio", .5), ...).
         """
         ranked = self._rank(query, mode, as_of, where, recency_half_life, pool, exact,
-                            when=when, now=now, rerank=rerank, rerank_pool=rerank_pool, principal=principal)
+                            when=when, now=now, rerank=rerank, rerank_pool=rerank_pool, principal=principal, graph=graph)
         if cutoff is not None:
             ranked = ranked[: keep_count([sc for _, sc in ranked[:k]], cutoff)]
         vis = self._mask(as_of, None, None, principal) if context else None
@@ -426,7 +428,7 @@ class Memory:
     def _rank(self, query: str, mode: str, as_of: float | None, where: dict[str, Any] | None,
               recency_half_life: float | None, pool: int, exact: bool, *,
               when=None, now: float | None = None, rerank=None,
-              rerank_pool: int = 30, principal=None) -> list[tuple[int, float]]:
+              rerank_pool: int = 30, principal=None, graph=None) -> list[tuple[int, float]]:
         """Ranked (frame id, score) candidates, best first, at most ~pool of them."""
         n = len(self.store)
         if n == 0:
@@ -449,13 +451,16 @@ class Memory:
                 vec_hits = self._exact_vec(q, mask, pool, visible)
         if mode in ("hybrid", "lexical"):
             lex_hits = self.bm25.search(query, mask, pool)
+        graph_hits: list[tuple[int, float]] = []
+        if graph is not None and mode == "hybrid":  # entity-linked retrieval as a third RRF list
+            graph_hits = [(f, sc) for f, sc in graph.hits(query, as_of) if mask[f]]
         if mode == "vector":
             ranked = vec_hits
         elif mode == "lexical":
             ranked = lex_hits
         else:
             fused: dict[int, float] = {}
-            for hits in (vec_hits, lex_hits):
+            for hits in (vec_hits, lex_hits, graph_hits):
                 for rank, (fid, _) in enumerate(hits):
                     fused[fid] = fused.get(fid, 0.0) + 1.0 / (RRF_K + rank + 1)
             ranked = list(fused.items())

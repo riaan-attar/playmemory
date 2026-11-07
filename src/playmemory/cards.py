@@ -99,14 +99,17 @@ class LLMExtractor:
 
 
 def remember(mem: Memory, text: str, extractor: Extractor | None = None,
-             t: float | None = None, meta: dict | None = None) -> tuple[Frame, list[Frame]]:
+             t: float | None = None, meta: dict | None = None, schema=None) -> tuple[Frame, list[Frame]]:
     """Store `text` as a raw frame, then extract cards from it. Returns
-    (raw frame, card frames added). Exclusive slots supersede older values;
+    (raw frame, card frames added). With `schema` (playmemory.graph.Schema) cards are validated
+    and cardinality comes from it. Exclusive slots supersede older values;
     repeating an identical card is a no-op."""
     extractor = extractor or RuleExtractor()
     raw = mem.add(text, {**(meta or {}), "kind": "raw"}, t)
     added: list[Frame] = []
     for card in extractor.extract(text):
+        if schema is not None:
+            card = schema.validate(card)  # raises SchemaError; sets one-vs-many exclusivity
         current = mem.find({"kind": "card", "card_key": card.key})
         cmeta = {"kind": "card", "card_key": card.key, "card_kind": card.kind,
                  "subject": card.subject, "predicate": card.predicate,
