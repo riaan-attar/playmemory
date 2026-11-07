@@ -50,7 +50,7 @@ def _valleys(sims: np.ndarray, w: int, thr: float) -> np.ndarray:
 def _forced(metas: list[dict], times: list[float], cfg: EpisodeConfig) -> list[int]:
     out = []
     for i in range(1, len(metas)):
-        if cfg.boundary_key and metas[i].get(cfg.boundary_key) != metas[i - 1].get(cfg.boundary_key):
+        if cfg.boundary_key and (metas[i] or {}).get(cfg.boundary_key) != (metas[i - 1] or {}).get(cfg.boundary_key):
             out.append(i)
         elif cfg.gap_seconds is not None and times[i] - times[i - 1] > cfg.gap_seconds:
             out.append(i)

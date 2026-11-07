@@ -14,9 +14,9 @@ from .ann import AnnIndex
 from .embed import Embedder, HashEmbedder, from_spec
 from .episodes import EpisodeConfig, EpisodeIndex
 from .frame import Frame, Hit, Span
-from .index import SegmentIndex
+from .index import VectorMatrix
 from .lexical import TOKENIZER_VERSION, BM25Index, tokenize
-from .store import FrameStore, _fsync_dir, read_header
+from .store import FLAG_VEC_F16, FileChangedError, FrameStore, _fsync_dir, read_header
 
 RRF_K = 60
 MAX_TEXT_BYTES = 1 << 20  # 1 MiB per frame
@@ -27,6 +27,8 @@ def _locked(fn):
     @functools.wraps(fn)
     def wrapper(self, *a, **kw):
         with self._lock:
+            if self.auto_refresh:
+                self._refresh_impl()
             return fn(self, *a, **kw)
 
     return wrapper
@@ -57,14 +59,14 @@ class Memory:
         self,
         path: str | os.PathLike | None = None,
         embedder: Embedder | str | None = None,
-        segment_size: int = 64,
-        approx: bool = False,
         *,
         ann_threshold: int | None = 200_000,
         episode_config: EpisodeConfig | None = None,
         read_only: bool = False,
         sync: str = "batch",
-        sync_every: int = 0,
+        sync_every: int = 100,
+        vec_dtype: str = "float32",
+        auto_refresh: bool = False,
         max_text_bytes: int = MAX_TEXT_BYTES,
         max_meta_bytes: int = MAX_META_BYTES,
     ):
@@ -74,18 +76,21 @@ class Memory:
         if embedder is None and path is not None and Path(path).exists() and Path(path).stat().st_size:
             embedder = from_spec(read_header(path)["spec"])  # reopen with the embedder the file was built with
         if embedder is None:
-            import warnings
+            import os as _os
 
-            warnings.warn(
-                "HashEmbedder is a non-semantic debug embedder; pass a real one "
-                "(OnnxEmbedder / SentenceTransformerEmbedder / HTTPEmbedder) in production",
-                stacklevel=2,
-            )
-            embedder = HashEmbedder()
+            if _os.environ.get("PLAYMEMORY_ALLOW_DEBUG_EMBEDDER") == "1":
+                embedder = HashEmbedder()
+            else:
+                raise ValueError(
+                    "no embedder given: pass e.g. OnnxEmbedder() / 'onnx' / HTTPEmbedder(...). "
+                    "Use 'debug' (non-semantic, tests only) or set PLAYMEMORY_ALLOW_DEBUG_EMBEDDER=1."
+                )
         self.embedder = embedder
         self.read_only = read_only
-        self.segment_size = segment_size
-        self.approx = approx
+        if vec_dtype not in ("float32", "float16"):
+            raise ValueError("vec_dtype must be float32 or float16")
+        self._flags = FLAG_VEC_F16 if vec_dtype == "float16" else 0
+        self.auto_refresh = auto_refresh and read_only
         self.ann_threshold = ann_threshold
         self.episode_config = episode_config or EpisodeConfig()
         self.max_text_bytes = max_text_bytes
@@ -97,13 +102,10 @@ class Memory:
     def _open(self) -> None:
         self.store = FrameStore(
             self.path, self.embedder.dim, self.embedder.name,
-            spec=getattr(self.embedder, "spec", self.embedder.name),
+            spec=getattr(self.embedder, "spec", self.embedder.name), flags=self._flags,
             read_only=self.read_only, sync=self._sync, sync_every=self._sync_every,
         )
-        self.index = SegmentIndex(
-            self.embedder.dim, self.segment_size,
-            exact_below=2048 if self.approx else 1 << 62,
-        )
+        self.index = VectorMatrix(self.embedder.dim)
         cp = self.store.checkpoint_arrays
         bm_ok = cp is not None and "bm_tokver" in cp and int(cp["bm_tokver"][0]) == TOKENIZER_VERSION
         self.bm25 = BM25Index.from_arrays(cp) if bm_ok else BM25Index()
@@ -134,7 +136,8 @@ class Memory:
             self._del_np[fid] = dt
         self._meta_ix: dict[str, dict[Any, list[int]]] = {}
         for fid, m in enumerate(self.store.metas):
-            self._index_meta(fid, m)
+            if m:
+                self._index_meta(fid, m)
 
     def _index_meta(self, fid: int, meta: dict) -> None:
         for k, v in meta.items():
@@ -210,6 +213,37 @@ class Memory:
         self._del_np[old_id] = self.store.deleted[old_id]
         return new
 
+    # multi-process reads -------------------------------------------------------
+    def _refresh_impl(self) -> int:
+        try:
+            first, newdel = self.store.refresh()
+        except FileChangedError:  # writer compacted/replaced the file: start over
+            self.store.close()
+            self._open()
+            return len(self.store)
+        n = len(self.store)
+        if n > first:
+            vecs = self.store.load_vectors(first)
+            for fid, text in self.store.tail_texts:
+                self.bm25.add(text)
+            self.store.tail_texts = []
+            for fid in range(first, n):
+                if self.store.metas[fid]:
+                    self._index_meta(fid, self.store.metas[fid])
+            self._grow(n)
+            self.index.add(vecs)
+            if self.ann is not None:
+                self.ann.add(vecs)
+        for fid in newdel:
+            self._del_np[fid] = self.store.deleted[fid]
+        return n - first
+
+    def refresh(self) -> int:
+        """Pick up what another process has written since this handle last looked.
+        Returns the number of new frames (0 if nothing changed)."""
+        with self._lock:
+            return self._refresh_impl()
+
     # durability ---------------------------------------------------------------
     @_writes
     def commit(self) -> None:
@@ -246,7 +280,7 @@ class Memory:
         tmp = self.path.with_name(self.path.name + ".compact")
         if tmp.exists():
             tmp.unlink()
-        new = Memory(tmp, self.embedder, self.segment_size, self.approx,
+        new = Memory(tmp, self.embedder, vec_dtype="float16" if self._flags & FLAG_VEC_F16 else "float32",
                      ann_threshold=self.ann_threshold, episode_config=self.episode_config,
                      sync="never")
         vecs = self.index.vectors[keep] if keep else np.zeros((0, self.embedder.dim), np.float32)
@@ -287,7 +321,7 @@ class Memory:
             try:
                 ids = self._meta_ix.get(k, {}).get(v, ())
             except TypeError:  # unhashable filter value: scan
-                ids = [i for i, m in enumerate(self.store.metas) if m.get(k) == v]
+                ids = [i for i, m in enumerate(self.store.metas) if (m or {}).get(k) == v]
             sel = np.zeros(n, dtype=bool)
             if len(ids):
                 sel[np.asarray(ids, dtype=np.int64)] = True
@@ -329,18 +363,15 @@ class Memory:
         lex_hits: list[tuple[int, float]] = []
         if mode in ("hybrid", "vector"):
             q = self.embedder.embed([query])[0]
-            if self.approx:
-                vec_hits = [(i, s) for i, s in self.index.search(q, pool * 4) if mask[i]][:pool]
-            else:
-                visible = int(mask.sum())
-                if self.ann is not None and not exact and visible >= 0.5 * n and n > pool * 8:
-                    # ANN with over-fetch; if too many hits are masked, go exact
-                    fetch = min(n, pool * 4 + (n - visible) * 2)
-                    vec_hits = [(i, s) for i, s in self.ann.search(q, fetch) if mask[i]][:pool]
-                    if len(vec_hits) < min(pool, visible):
-                        vec_hits = self._exact_vec(q, mask, pool, visible)
-                else:
+            visible = int(mask.sum())
+            if self.ann is not None and not exact and visible >= 0.5 * n and n > pool * 8:
+                # ANN with over-fetch; if too many hits are masked, go exact
+                fetch = min(n, pool * 4 + (n - visible) * 2)
+                vec_hits = [(i, s) for i, s in self.ann.search(q, fetch) if mask[i]][:pool]
+                if len(vec_hits) < min(pool, visible):
                     vec_hits = self._exact_vec(q, mask, pool, visible)
+            else:
+                vec_hits = self._exact_vec(q, mask, pool, visible)
         if mode in ("hybrid", "lexical"):
             lex_hits = self.bm25.search(query, mask, pool)
         if mode == "vector":

@@ -15,7 +15,6 @@ import numpy as np
 
 from bench.baseline_rag import FlatBaseline, HNSWBaseline
 from playmemory import Memory
-from playmemory.index import SegmentIndex
 
 K = 10
 N_QUERIES = 200
@@ -53,7 +52,7 @@ def timed(fn, queries) -> tuple[list[list[int]], list[float]]:
 def run(n: int, shuffled: bool, llm_ms: float) -> None:
     rng = np.random.default_rng(42)
     texts = make_texts(n, shuffled, rng)
-    mem = Memory(segment_size=64)
+    mem = Memory(embedder="debug")
     t0 = time.perf_counter()
     mem.add_many(texts, times=[float(i) for i in range(n)])
     build_pm = time.perf_counter() - t0
@@ -74,20 +73,13 @@ def run(n: int, shuffled: bool, llm_ms: float) -> None:
     t0 = time.perf_counter(); hnsw = HNSWBaseline(vecs); b_hnsw = time.perf_counter() - t0
     systems["faiss-flat"] = (lambda q: flat.search(q, K), b_flat, flat.nbytes())
     systems["faiss-hnsw"] = (lambda q: hnsw.search(q, K), b_hnsw, hnsw.nbytes())
-    approx = SegmentIndex(vecs.shape[1], 64, exact_below=2048)
-    approx.add(vecs)
     systems["pm-exact"] = (
-        lambda q: [i for i, _ in mem.index.search(q, K)],
+        lambda q: [i for i, _ in mem._exact_vec(q, np.ones(n, dtype=bool), K, n)],
         build_pm,
         vecs.nbytes,
     )
     t0 = time.perf_counter(); mem.build_ann(); b_ann = time.perf_counter() - t0
     systems["pm-ann"] = (lambda q: [i for i, _ in mem.ann.search(q, K)], b_ann, vecs.nbytes * 1.15)
-    systems["pm-centroid"] = (
-        lambda q: [i for i, _ in approx.search(q, K)],
-        0.0,
-        vecs.nbytes + approx.n_segments * vecs.shape[1] * 4,
-    )
 
     label = "shuffled" if shuffled else "clustered"
     print(f"\n== n={n:,} ({label}), k={K}, {N_QUERIES} queries ==")

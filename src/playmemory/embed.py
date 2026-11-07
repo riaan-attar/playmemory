@@ -169,6 +169,8 @@ def from_spec(spec: str, api_key: str | None = None) -> Embedder:
     """Build an embedder from a short spec: hash[-DIM] | onnx[:REPO] | st[:MODEL] |
     http:URL|MODEL[|APIKEY]."""
     kind, _, rest = spec.partition(":")
+    if kind == "debug":
+        return HashEmbedder()
     if kind.startswith("hash"):
         dim = int(kind.split("-")[1]) if "-" in kind else 256
         return HashEmbedder(dim)

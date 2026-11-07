@@ -45,20 +45,6 @@ def test_persistence_roundtrip(tmp_path):
     assert [x.name for x in tmp_path.iterdir()] == ["mem.pmem"]  # single file
 
 
-def test_hierarchical_search_recall_on_large_synthetic():
-    rng = np.random.default_rng(0)
-    words = [f"w{i}" for i in range(3000)]
-    texts = [" ".join(rng.choice(words, 8)) for _ in range(6000)]
-    m = Memory(segment_size=64)
-    m.add_many(texts, times=list(map(float, range(len(texts)))))
-    # Query with the full text of a frame -> that frame must be found. The
-    # random frames have no temporal locality, so give the segment search
-    # more segments than the default; exactness is the goal here.
-    q = m.embedder.embed([texts[4321]])[0]
-    ids = [i for i, _ in m.index.search(q, 1, n_segments=m.index.n_segments)]
-    assert ids == [4321]
-
-
 def _facts():
     m = Memory()
     m.add_many(

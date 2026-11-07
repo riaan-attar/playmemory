@@ -17,8 +17,18 @@ def _open(args, read_only=False) -> Memory:
     if emb is None:
         try:
             emb = from_spec(read_header(args.file)["spec"], args.api_key)
-        except FileNotFoundError:
-            emb = HashEmbedder()  # brand-new file: debug embedder unless --embedder given
+        except FileNotFoundError:  # brand-new file: need an embedder
+            import os
+
+            if os.environ.get("PLAYMEMORY_ALLOW_DEBUG_EMBEDDER") == "1":
+                emb = HashEmbedder()
+            else:
+                try:
+                    import onnxruntime  # noqa: F401
+                except ImportError:
+                    raise SystemExit("new file: pass --embedder (e.g. http:URL|MODEL) or "
+                                     "pip install 'playmemory[onnx]' to use the local default")
+                emb = from_spec("onnx")
     return Memory(args.file, emb, read_only=read_only)
 
 
@@ -66,6 +76,9 @@ def main(argv: list[str] | None = None) -> int:
     f = sub.add_parser("forget"); f.add_argument("id", type=int)
     sub.add_parser("stats")
     sub.add_parser("verify")
+    dr = sub.add_parser("doctor", help="diagnose damage; with --write salvage intact records")
+    dr.add_argument("--write", action="store_true", help="write FILE.repaired")
+    dr.add_argument("--replace", action="store_true", help="with --write: keep the damaged file as FILE.corrupt and replace it")
     sub.add_parser("checkpoint")
     c = sub.add_parser("compact"); c.add_argument("--keep-history", action="store_true")
     sub.add_parser("export", help="dump all frames as JSONL")
@@ -79,6 +92,14 @@ def main(argv: list[str] | None = None) -> int:
             records, bad = st.verify()
             _print({"records": records, "bad_bytes": bad, "ok": bad == 0})
             return 0 if bad == 0 else 2
+        if args.cmd == "doctor":
+            from dataclasses import asdict
+
+            from .doctor import diagnose, repair
+
+            rep = repair(args.file, replace=args.replace) if args.write or args.replace else diagnose(args.file)
+            _print(asdict(rep))
+            return 0 if rep.ok else 2
         read_only = args.cmd in ("search", "story", "read", "seek", "window", "stats", "export")
         m = _open(args, read_only)
     try:

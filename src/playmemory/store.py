@@ -17,6 +17,8 @@ from .frame import Frame
 MAGIC = b"PMEM"
 VERSION = 3  # v3 = v2 + embedder spec + flags in the header; record formats are identical
 READ_VERSIONS = (2, 3)
+FLAG_VEC_F16 = 1  # vectors stored as float16 (half the size), read back as float32
+Z_MIN_JSON = 200  # don't bother compressing tiny records
 _HDR = struct.Struct("<4sHHH")  # magic, version, dim, name_len
 _SPEC = struct.Struct("<H")
 _FLAGS = struct.Struct("<I")
@@ -28,6 +30,7 @@ _JLEN = struct.Struct("<I")
 REC_FRAME = 1
 REC_TOMBSTONE = 2
 REC_CHECKPOINT = 3  # derived index state; safe to ignore or drop (compaction)
+REC_FRAME_Z = 5  # frame whose JSON part is zlib-compressed (used only when it shrinks)
 REC_ANN = 4  # serialized ANN graph: u64 frames covered | blob (derived, droppable)
 
 
@@ -68,6 +71,10 @@ class ModelMismatchError(ValueError):
 
 class CorruptFileError(ValueError):
     pass
+
+
+class FileChangedError(RuntimeError):
+    """The file under an open store was replaced (e.g. compacted by the writer)."""
 
 
 class LockedError(RuntimeError):
@@ -165,6 +172,7 @@ class FrameStore:
         self.sync_mode = sync
         self.sync_every = sync_every
         self._unsynced = 0
+        self._set_vec_dtype()
         self._offsets: list[int] = []
         self._voffs: list[int] = []
         self._times: list[float] = []
@@ -207,6 +215,10 @@ class FrameStore:
                 os.close(self._fd)
                 self._fd = None
             raise
+
+    def _set_vec_dtype(self) -> None:
+        self._vdt = np.float16 if self.flags & FLAG_VEC_F16 else np.float32
+        self._vsz = self.dim * np.dtype(self._vdt).itemsize
 
     # raw io ---------------------------------------------------------------
     def _size(self) -> int:
@@ -279,6 +291,7 @@ class FrameStore:
         else:
             self.spec = self.spec or model
         self._pos0 = pos0  # offset of the first record
+        self._set_vec_dtype()
 
         # 1) hop the length chain to find the last checkpoint (no CRC work)
         cp = None
@@ -306,6 +319,25 @@ class FrameStore:
                 self._reset_state()
 
         # 3) replay everything after the checkpoint with full CRC checks
+        pos = self._replay(data, start, size)
+        if pos < size:
+            self.dropped_bytes = size - pos
+            if not self.read_only:
+                self._truncate(pos)
+        return pos
+
+    def _parse_frame(self, body: bytes, pos: int):
+        """-> (record dict, absolute vector offset) or None when malformed."""
+        jl = _JLEN.unpack_from(body, 1)[0]
+        if len(body) != 1 + 4 + jl + self._vsz:
+            return None
+        raw = body[5 : 5 + jl]
+        if body[0] == REC_FRAME_Z:
+            raw = zlib.decompress(raw)
+        return json.loads(raw), pos + 4 + 1 + 4 + jl
+
+    def _replay(self, data, start: int, size: int) -> int:
+        """Apply every valid record in data[start:size]; return the end of the valid prefix."""
         pos = start
         while pos + 4 <= size:
             (n,) = _LEN.unpack_from(data, pos)
@@ -317,27 +349,25 @@ class FrameStore:
             if zlib.crc32(body) != crc:
                 break
             rtype = body[0]
-            if rtype == REC_FRAME:
-                jl = _JLEN.unpack_from(body, 1)[0]
-                if len(body) != 1 + 4 + jl + self.dim * 4:
+            if rtype in (REC_FRAME, REC_FRAME_Z):
+                try:
+                    parsed = self._parse_frame(body, pos)
+                except (ValueError, zlib.error, struct.error):
+                    parsed = None
+                if parsed is None:
                     break
-                rec = json.loads(body[5 : 5 + jl])
+                rec, voff = parsed
                 fid = len(self._times)
                 self._offsets.append(pos)
-                self._voffs.append(pos + 4 + 1 + 4 + jl)
+                self._voffs.append(voff)
                 self._times.append(rec["t"])
-                self.metas.append(rec["meta"])
+                self.metas.append(rec["meta"] or None)
                 self.tail_texts.append((fid, rec["text"]))
             elif rtype == REC_TOMBSTONE:
                 fid, t = _TOMB.unpack(body[1:])
                 self.deleted[fid] = t
-            elif rtype == REC_CHECKPOINT:
-                pass  # superseded or corrupt-skipped older checkpoint
+            # checkpoint / ann records carry no frame state here
             pos = end
-        if pos < size:
-            self.dropped_bytes = size - pos
-            if not self.read_only:
-                self._truncate(pos)
         return pos
 
     def _reset_state(self) -> None:
@@ -367,16 +397,16 @@ class FrameStore:
         self.checkpoints += 1
 
     # vectors ------------------------------------------------------------------
-    def load_vectors(self) -> np.ndarray:
-        """All embeddings in frame order, read straight from the file."""
-        n = len(self._voffs)
-        out = np.empty((n, self.dim), dtype=np.float32)
-        if n == 0:
+    def load_vectors(self, start: int = 0) -> np.ndarray:
+        """Embeddings of frames start.. in order (float32), read straight from the file."""
+        n = len(self._voffs) - start
+        out = np.empty((max(n, 0), self.dim), dtype=np.float32)
+        if n <= 0:
             return out
         data = self._data()
         try:
-            for i, off in enumerate(self._voffs):
-                out[i] = np.frombuffer(data, np.float32, self.dim, off)
+            for i, off in enumerate(self._voffs[start:]):
+                out[i] = np.frombuffer(data, self._vdt, self.dim, off)
         finally:
             if isinstance(data, mmap.mmap):
                 try:
@@ -384,6 +414,36 @@ class FrameStore:
                 except BufferError:
                     pass
         return out
+
+    def meta_of(self, fid: int) -> dict:
+        return self.metas[fid] or {}
+
+    def refresh(self) -> tuple[int, set[int]]:
+        """Pick up records appended (by a writer in another process) since we
+        last looked. Returns (first new frame id, ids newly tombstoned).
+        Raises FileChangedError if the file was replaced/truncated (compaction)."""
+        if self._fd is None:
+            return len(self._times), set()
+        size = os.fstat(self._fd).st_size
+        try:
+            same = os.path.samestat(os.fstat(self._fd), os.stat(self.path))
+        except OSError:
+            same = False
+        if not same or size < self._end:
+            raise FileChangedError("file was replaced or truncated")
+        first, before = len(self._times), set(self.deleted)
+        if size == self._end:
+            return first, set()
+        data = self._data()
+        try:
+            self._end = self._replay(data, self._end, size)
+        finally:
+            if isinstance(data, mmap.mmap):
+                try:
+                    data.close()
+                except BufferError:
+                    pass
+        return first, set(self.deleted) - before
 
     # records ------------------------------------------------------------------
     def _append_record(self, rtype: int, payload: bytes) -> int:
@@ -419,16 +479,22 @@ class FrameStore:
     def append(self, t: float, text: str, meta: dict | None, vec: np.ndarray) -> Frame:
         if self._times and t < self._times[-1]:
             raise ValueError("timestamps must be non-decreasing")
-        j = json.dumps({"t": t, "text": text, "meta": meta or {}}, separators=(",", ":")).encode()
+        fid = len(self._times)
+        j = json.dumps({"i": fid, "t": t, "text": text, "meta": meta or {}},
+                       separators=(",", ":"), ensure_ascii=False).encode()
         v = np.asarray(vec, dtype=np.float32).reshape(-1)
         if v.shape[0] != self.dim:
             raise ValueError(f"vector dim {v.shape[0]} != {self.dim}")
-        off = self._append_record(REC_FRAME, _JLEN.pack(len(j)) + j + v.tobytes())
-        fid = len(self._times)
+        rtype = REC_FRAME
+        if len(j) >= Z_MIN_JSON:
+            z = zlib.compress(j, 3)
+            if len(z) < 0.9 * len(j):
+                j, rtype = z, REC_FRAME_Z
+        off = self._append_record(rtype, _JLEN.pack(len(j)) + j + v.astype(self._vdt).tobytes())
         self._offsets.append(off)
         self._voffs.append(off + 4 + 1 + 4 + len(j))
         self._times.append(t)
-        self.metas.append(meta or {})
+        self.metas.append(meta or None)
         return Frame(fid, t, text, meta or {})
 
     def delete(self, fid: int, t: float) -> None:
@@ -480,10 +546,12 @@ class FrameStore:
         if not 0 <= fid < len(self._times):
             raise IndexError(fid)
         off = self._offsets[fid]
-        (n,) = _LEN.unpack(self._read(off, 4))
+        head = self._read(off, 5)
+        (n,) = _LEN.unpack_from(head)
         payload = self._read(off + 5, n - 1)
         jl = _JLEN.unpack_from(payload, 0)[0]
-        rec = json.loads(payload[4 : 4 + jl])
+        raw = payload[4 : 4 + jl]
+        rec = json.loads(zlib.decompress(raw) if head[4] == REC_FRAME_Z else raw)
         return Frame(fid, rec["t"], rec["text"], rec["meta"])
 
     def range(self, start: int, stop: int, live_only: bool = False,

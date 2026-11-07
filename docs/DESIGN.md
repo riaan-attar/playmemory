@@ -41,7 +41,7 @@ benchmark data is synthetic.
 
 ## v0.2 update (after studying Memvid, see ROADMAP.md)
 - Default retrieval is now hybrid: BM25 + exact vector search fused by RRF. The centroid
-  index is kept only as `Memory(approx=True)`.
+  index was later removed (see CHANGELOG 0.4.0).
 - Exact numpy search at 100k: recall 1.00, p50 7.5 ms (faiss-flat 11.7 ms, HNSW 0.7 ms).
   Hybrid full API (embed + BM25 + vector + fetch frames with context): ~10 ms at 100k.
   Centroid routing stays at recall 0.38 (clustered) / 0.06 (shuffled): not recommended.

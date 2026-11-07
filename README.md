@@ -74,8 +74,10 @@ with Memory("agent.pmem", OnnxEmbedder()) as m:
     m.read(0, 5)     # "press play" on a pointer: frames 0..5 inclusive
 ```
 
-Without an embedder, `Memory` falls back to `HashEmbedder` and emits a warning. That embedder
-is lexical only and meant for tests; use a real one in production.
+`Memory` requires an embedder: pass an object, a spec string (`"onnx"`, `"st:MODEL"`, `"http:URL|MODEL"`), or reopen an
+existing file, which rebuilds the embedder it was created with from the spec stored in its header (API keys are never
+stored; use `--api-key` or `PLAYMEMORY_API_KEY`). `"debug"` (or `PLAYMEMORY_ALLOW_DEBUG_EMBEDDER=1`) selects a lexical,
+non-semantic embedder for tests only.
 
 ## Core concepts
 
@@ -95,13 +97,14 @@ is lexical only and meant for tests; use a real one in production.
 | Parameter | Default | Notes |
 |---|---|---|
 | `path` | `None` | `None` keeps everything in RAM. |
-| `embedder` | `None` | Any object with `embed(list[str]) -> ndarray`. The file is bound to the embedder that created it; opening with a different one raises `ModelMismatchError`. |
-| `approx` | `False` | Use the centroid segment index instead of exact search. See [Scaling](#scaling). |
+| `embedder` | required for new files | An object with `embed(list[str]) -> ndarray`, or a spec string. The file is bound to the embedder that created it; opening with a different one raises `ModelMismatchError`. |
+| `vec_dtype` | `"float32"` | `"float16"` stores vectors at half the size (new files only; recorded in the header). |
+| `auto_refresh` | `False` | With `read_only=True`, every call first picks up what a writer process has appended. `refresh()` does it on demand. |
 | `ann_threshold` | `200_000` | Frame count at which the HNSW index is used, if faiss is installed. |
 | `episode_config` | `EpisodeConfig()` | Scene segmentation settings. |
 | `read_only` | `False` | Open without taking the writer lock. |
 | `sync` | `"batch"` | `"always"` fsyncs every write, `"batch"` on commit and close, `"never"` leaves it to the OS. |
-| `sync_every` | `0` | Extra fsync cadence in writes. |
+| `sync_every` | `100` | With `"batch"`, fsync every N writes, so a power loss can lose at most about N records. |
 | `max_text_bytes`, `max_meta_bytes` | module limits | Per-frame size caps. |
 
 ### Writing
@@ -207,6 +210,7 @@ playmemory agent.pmem seek 12.5
 playmemory agent.pmem window 10 20
 playmemory agent.pmem forget 7
 playmemory agent.pmem stats | verify | checkpoint | export
+playmemory agent.pmem doctor [--write [--replace]]   # salvage intact records after mid-file damage
 playmemory agent.pmem compact [--keep-history]
 playmemory agent.pmem serve                          # MCP over stdio
 ```
@@ -237,7 +241,9 @@ Tools: `remember`, `recall`, `recall_story`, `read_span`, `forget`, `seek`, `tim
   loses at most the uncommitted tail.
 - `compact()` writes a new file and swaps it in atomically.
 - One writer at a time (`LockedError` otherwise). Readers never block and never lock.
-- `playmemory FILE verify` re-checks every record.
+- `playmemory FILE verify` re-checks every record; `doctor` resynchronises past damage anywhere in the file and writes
+  a salvaged copy (`--write`, or `--replace` to keep the original as `FILE.corrupt`). Lost frames shift ids, so
+  tombstones and `supersedes`/`source` pointers are remapped.
 - Size limits on text and metadata guard against runaway frames.
 
 ## Scaling
@@ -251,9 +257,8 @@ Measured with the hash embedder on synthetic clustered text at 100k frames: exac
 recall 1.00 at p50 about 7 to 10 ms; HNSW has recall 0.996 at about 0.6 ms; the full hybrid API
 runs at about 2.2 ms. Opening takes 2.25 s without a checkpoint and 0.5 s with one.
 
-`approx=True` selects the older centroid segment index. It is kept for experiments only: it is
-slower than HNSW at equal recall and collapses when the data is not temporally clustered
-(`docs/DESIGN.md`).
+The older centroid segment index was removed: it was slower than HNSW at equal recall and
+collapsed when the data was not temporally clustered (`docs/DESIGN.md`).
 
 ## Benchmarks
 
@@ -285,7 +290,7 @@ Full tables, per-category numbers and caveats are in [docs/RESULTS.md](docs/RESU
   up; the value is temporal context, time travel, a portable single file and cheap appends.
 - Memvid was not run (no Rust toolchain), so there are no head-to-head numbers. Compared with
   Memvid (Rust, multimodal, encryption, graph) this is a smaller Python engine.
-- The default `HashEmbedder` is non-semantic.
+- `HashEmbedder` (`"debug"`) is non-semantic; production code must pass a real embedder.
 
 ## Project layout
 
@@ -295,7 +300,8 @@ src/playmemory/
   store.py      FrameStore: single-file format, locking, recovery
   lexical.py    BM25Index (numpy)
   ann.py        AnnIndex (faiss HNSW, persisted)
-  index.py      SegmentIndex (centroid routing, approx mode)
+  index.py      VectorMatrix (growing embedding matrix)
+  doctor.py     diagnose/salvage a damaged file
   episodes.py   scene segmentation and EpisodeIndex
   cards.py      memory cards, extractors, remember(), profile()
   embed.py      embedders and from_spec()
