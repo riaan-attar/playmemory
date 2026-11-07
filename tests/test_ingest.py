@@ -264,3 +264,44 @@ def test_mcp_ingest_is_root_restricted(tmp_path):
     assert r["isError"] and "outside the allowed" in r["content"][0]["text"]
     r = rpc(srv, "tools/call", {"name": "ingest", "arguments": {"path": str(allowed / ".." / "outside.txt")}})["result"]
     assert r["isError"]  # path traversal is resolved before the check
+
+
+# ---- images (fake CLIP-like embedder) and precomputed vectors -----------------------
+class _FakeClip:
+    dim, name, spec = 8, "fake-clip", "fake-clip"
+
+    def embed(self, texts):
+        import numpy as np
+        out = np.zeros((len(texts), 8), np.float32)
+        for i, t in enumerate(texts):
+            out[i, 0 if "cat" in t else 1] = 1.0
+        return out
+
+    def embed_images(self, paths):
+        import numpy as np
+        out = np.zeros((len(paths), 8), np.float32)
+        for i, p in enumerate(paths):
+            out[i, 0 if "cat" in p else 1] = 1.0
+        return out
+
+
+def test_add_images_text_query_finds_image_by_vector(tmp_path):
+    m = Memory(embedder=_FakeClip())
+    (tmp_path / "cat_photo.jpg").write_bytes(b"x")
+    (tmp_path / "dog_photo.jpg").write_bytes(b"y")
+    frames = m.add_images([tmp_path / "cat_photo.jpg", tmp_path / "dog_photo.jpg"], captions=[None, "a happy dog"])
+    assert frames[0].text == "cat_photo.jpg" and frames[0].meta["kind"] == "image"
+    hit = m.search("a cat", k=1, mode="vector")[0].frame
+    assert hit.id == frames[0].id
+    with pytest.raises(TypeError):
+        Memory(embedder="debug").add_images([tmp_path / "cat_photo.jpg"])
+
+
+def test_add_many_precomputed_vectors_validated():
+    import numpy as np
+    m = Memory(embedder="debug")
+    v = m.embedder.embed(["alpha"])
+    m.add_many(["alpha"], vectors=v)
+    assert m.search("alpha", k=1, mode="vector")[0].frame.text == "alpha"
+    with pytest.raises(ValueError):
+        m.add_many(["a", "b"], vectors=np.zeros((1, 3)))

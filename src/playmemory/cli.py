@@ -29,7 +29,22 @@ def _open(args, read_only=False) -> Memory:
                     raise SystemExit("new file: pass --embedder (e.g. http:URL|MODEL) or "
                                      "pip install 'playmemory[onnx]' to use the local default")
                 emb = from_spec("onnx")
-    return Memory(args.file, emb, read_only=read_only)
+    return Memory(args.file, emb, read_only=read_only, password=_password(args))
+
+
+def _password(args, existing: bool = True):
+    """Password from --password-file / PLAYMEMORY_PASSWORD. For an existing file it is only
+    used when the file is actually encrypted."""
+    import os
+
+    pw = open(args.password_file).read().rstrip("\r\n") if args.password_file else os.environ.get("PLAYMEMORY_PASSWORD")
+    if pw is not None and existing:
+        try:
+            if not read_header(args.file)["encrypted"]:
+                return None
+        except FileNotFoundError:
+            pass
+    return pw
 
 
 def _reranker():
@@ -57,6 +72,14 @@ def _synth(spec: str):
     raise SystemExit(f"unknown --llm {spec!r}")
 
 
+def _transcriber(model):
+    if not model:
+        return None
+    from .ingest.audio import WhisperTranscriber
+
+    return WhisperTranscriber(model)
+
+
 def _frame_dict(f, score=None):
     d = {"id": f.id, "t": f.t, "text": f.text, "meta": f.meta}
     if score is not None:
@@ -72,6 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="playmemory", description="Timeline memory for AI systems")
     ap.add_argument("file", help="memory file (.pmem)")
     ap.add_argument("--api-key", default=None, help="key for http: embedders (or env PLAYMEMORY_API_KEY)")
+    ap.add_argument("--password-file", help="file holding the encryption password (also env PLAYMEMORY_PASSWORD)")
     ap.add_argument("--embedder", help="hash[-DIM] | onnx[:REPO] | st[:MODEL] | http:URL|MODEL[|KEY] "
                     "(default: the one the file was created with)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -121,6 +145,7 @@ def main(argv: list[str] | None = None) -> int:
     ig.add_argument("paths", nargs="+")
     ig.add_argument("--max-chars", type=int, default=800)
     ig.add_argument("--overlap", type=int, default=100)
+    ig.add_argument("--transcribe", metavar="MODEL", help="transcribe audio/video with faster-whisper (e.g. base)")
     ig.add_argument("--append", action="store_true", help="re-add changed files instead of replacing their old chunks")
     sv = sub.add_parser("serve", help="run an MCP server on stdio")
     sv.add_argument("--ingest-root", action="append", default=[],
@@ -130,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         if args.cmd == "verify":
-            st = FrameStore(args.file, read_header(args.file)["dim"], read_only=True)
+            st = FrameStore(args.file, read_header(args.file)["dim"], read_only=True, password=_password(args))
             records, bad = st.verify()
             _print({"records": records, "bad_bytes": bad, "ok": bad == 0})
             return 0 if bad == 0 else 2
@@ -139,7 +164,9 @@ def main(argv: list[str] | None = None) -> int:
 
             from .doctor import diagnose, repair
 
-            rep = repair(args.file, replace=args.replace) if args.write or args.replace else diagnose(args.file)
+            pw = _password(args)
+            rep = (repair(args.file, replace=args.replace, password=pw) if args.write or args.replace
+                   else diagnose(args.file, password=pw))
             _print(asdict(rep))
             return 0 if rep.ok else 2
         read_only = args.cmd in ("search", "ask", "story", "read", "seek", "window", "stats", "export")
@@ -167,7 +194,8 @@ def main(argv: list[str] | None = None) -> int:
             from dataclasses import asdict
 
             rep = m.ingest(args.paths, max_chars=args.max_chars, overlap=args.overlap,
-                           on_change="append" if args.append else "replace")
+                           on_change="append" if args.append else "replace",
+                           transcriber=_transcriber(args.transcribe))
             m.commit()
             d = asdict(rep)
             d.pop("frame_ids")

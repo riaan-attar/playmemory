@@ -178,6 +178,8 @@ def from_spec(spec: str, api_key: str | None = None) -> Embedder:
         return OnnxEmbedder(rest) if rest else OnnxEmbedder()
     if "/" in spec and ":" not in spec:  # bare sentence-transformers model id (older files)
         return SentenceTransformerEmbedder(spec)
+    if kind == "clip":
+        return ClipEmbedder(rest) if rest else ClipEmbedder()
     if kind == "st":
         return SentenceTransformerEmbedder(rest) if rest else SentenceTransformerEmbedder()
     if kind == "http":
@@ -187,3 +189,30 @@ def from_spec(spec: str, api_key: str | None = None) -> Embedder:
             raise ValueError("http spec is http:URL|MODEL[|APIKEY]")
         return HTTPEmbedder(parts[0], parts[1], parts[2] if len(parts) > 2 else api_key)
     raise ValueError(f"unknown embedder spec {spec!r}")
+
+
+class ClipEmbedder:
+    """Text and images in ONE vector space (CLIP via sentence-transformers; extra `images`).
+
+    Use it as the Memory embedder, then `Memory.add_images(paths)`: text queries find images
+    and vice versa. Heavy (torch); the default install never imports it.
+    """
+
+    def __init__(self, model: str = "sentence-transformers/clip-ViT-B-32"):
+        try:
+            from sentence_transformers import SentenceTransformer
+        except ImportError as e:
+            raise ImportError("CLIP needs the 'images' extra: pip install 'playmemory[images]'") from e
+        self._model = SentenceTransformer(model)
+        self.name = f"clip:{model}"
+        self.spec = f"clip:{model}"
+        self.dim = self._model.get_sentence_embedding_dimension()
+
+    def embed(self, texts: list[str]) -> np.ndarray:
+        return np.asarray(self._model.encode(texts, normalize_embeddings=True), dtype=np.float32)
+
+    def embed_images(self, paths: list[str]) -> np.ndarray:
+        from PIL import Image
+
+        imgs = [Image.open(p).convert("RGB") for p in paths]
+        return np.asarray(self._model.encode(imgs, normalize_embeddings=True), dtype=np.float32)

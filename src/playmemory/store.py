@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import hmac
 import io
 import json
 import mmap
@@ -12,12 +13,15 @@ from pathlib import Path
 
 import numpy as np
 
+from . import crypto as _crypto
 from .frame import Frame
 
 MAGIC = b"PMEM"
 VERSION = 3  # v3 = v2 + embedder spec + flags in the header; record formats are identical
 READ_VERSIONS = (2, 3)
 FLAG_VEC_F16 = 1  # vectors stored as float16 (half the size), read back as float32
+FLAG_ENCRYPTED = 2  # record payloads are AES-GCM sealed; header carries a KDF block
+REC_SIGNATURE = 6  # HMAC-SHA256 over every byte before this record
 Z_MIN_JSON = 200  # don't bother compressing tiny records
 _HDR = struct.Struct("<4sHHH")  # magic, version, dim, name_len
 _SPEC = struct.Struct("<H")
@@ -109,12 +113,16 @@ def read_header(path: str | os.PathLike) -> dict:
         if magic != MAGIC:
             raise CorruptFileError("not a PlayMemory file")
         name = f.read(nlen).decode()
-        spec, flags = name, 0
+        spec, flags, kdf = name, 0, b""
         if ver >= 3:
             (slen,) = _SPEC.unpack(f.read(2))
             spec = f.read(slen).decode()
             (flags,) = _FLAGS.unpack(f.read(4))
-    return {"version": ver, "dim": dim, "name": name, "spec": spec, "flags": flags}
+            if flags & FLAG_ENCRYPTED:
+                (klen,) = _SPEC.unpack(f.read(2))
+                kdf = f.read(klen)
+    return {"version": ver, "dim": dim, "name": name, "spec": spec, "flags": flags,
+            "encrypted": bool(flags & FLAG_ENCRYPTED), "kdf": kdf}
 
 
 def _fsync_dir(path: Path) -> None:
@@ -156,6 +164,7 @@ class FrameStore:
         *,
         spec: str = "",
         flags: int = 0,
+        password: str | bytes | None = None,
         read_only: bool = False,
         sync: str = "batch",
         sync_every: int = 0,
@@ -168,6 +177,8 @@ class FrameStore:
         self.spec = spec
         self.flags = flags
         self.version = VERSION
+        self._password = password
+        self._cipher = None
         self.read_only = read_only
         self.sync_mode = sync
         self.sync_every = sync_every
@@ -203,8 +214,13 @@ class FrameStore:
                 if read_only:
                     raise CorruptFileError("empty file")
                 name, sp = model.encode(), (spec or model).encode()
+                kdf = b""
+                if password is not None:
+                    kdf, self._cipher = _crypto.new_kdf_block(password)
+                    self.flags = flags = flags | FLAG_ENCRYPTED
+                    kdf = _SPEC.pack(len(kdf)) + kdf
                 self._write(_HDR.pack(MAGIC, VERSION, dim, len(name)) + name
-                            + _SPEC.pack(len(sp)) + sp + _FLAGS.pack(flags), 0)
+                            + _SPEC.pack(len(sp)) + sp + _FLAGS.pack(flags) + kdf, 0)
                 created = True
             self._end = self._scan()
             if created and self._fd is not None:
@@ -215,6 +231,15 @@ class FrameStore:
                 os.close(self._fd)
                 self._fd = None
             raise
+
+    def _plain(self, rtype: int, blob: bytes, off: int) -> bytes:
+        """Record payload as plaintext (unseals when the file is encrypted)."""
+        if self._cipher is None or rtype == REC_SIGNATURE:
+            return blob
+        try:
+            return self._cipher.unseal(blob, rtype, off)
+        except ValueError as e:
+            raise CorruptFileError(f"{e} at offset {off}") from e
 
     def _set_vec_dtype(self) -> None:
         self._vdt = np.float16 if self.flags & FLAG_VEC_F16 else np.float32
@@ -288,6 +313,16 @@ class FrameStore:
             self.spec = bytes(data[pos0 + 2 : pos0 + 2 + slen]).decode()
             (self.flags,) = _FLAGS.unpack_from(data, pos0 + 2 + slen)
             pos0 += 2 + slen + 4
+            if self.flags & FLAG_ENCRYPTED:
+                (klen,) = _SPEC.unpack_from(data, pos0)
+                kdf = bytes(data[pos0 + 2 : pos0 + 2 + klen])
+                pos0 += 2 + klen
+                if self._cipher is None:  # existing file (a new one already has its cipher)
+                    if self._password is None:
+                        raise _crypto.EncryptedFileError("file is encrypted: a password is required")
+                    self._cipher = _crypto.open_kdf_block(kdf, self._password)
+            elif self._password is not None and self._cipher is None:
+                raise ValueError("file is not encrypted but a password was given")
         else:
             self.spec = self.spec or model
         self._pos0 = pos0  # offset of the first record
@@ -334,7 +369,8 @@ class FrameStore:
         raw = body[5 : 5 + jl]
         if body[0] == REC_FRAME_Z:
             raw = zlib.decompress(raw)
-        return json.loads(raw), pos + 4 + 1 + 4 + jl
+        # vector offset; for encrypted files the record start (vectors are read by unsealing)
+        return json.loads(raw), (pos if self._cipher is not None else pos + 4 + 1 + 4 + jl)
 
     def _replay(self, data, start: int, size: int) -> int:
         """Apply every valid record in data[start:size]; return the end of the valid prefix."""
@@ -349,6 +385,8 @@ class FrameStore:
             if zlib.crc32(body) != crc:
                 break
             rtype = body[0]
+            if self._cipher is not None and rtype in (REC_FRAME, REC_FRAME_Z, REC_TOMBSTONE):
+                body = bytes([rtype]) + self._plain(rtype, body[1:], pos)
             if rtype in (REC_FRAME, REC_FRAME_Z):
                 try:
                     parsed = self._parse_frame(body, pos)
@@ -382,7 +420,7 @@ class FrameStore:
         body = bytes(data[pos + 4 : end - 4])
         if zlib.crc32(body) != _CRC.unpack_from(data, end - 4)[0]:
             raise CorruptFileError("bad checkpoint crc")
-        z = np.load(io.BytesIO(body[1:]), allow_pickle=False)
+        z = np.load(io.BytesIO(self._plain(REC_CHECKPOINT, body[1:], pos)), allow_pickle=False)
         arrays = {k: z[k] for k in z.files}
         n = len(arrays["times"])
         if len(arrays["offsets"]) != n or len(arrays["voffs"]) != n:
@@ -405,8 +443,16 @@ class FrameStore:
             return out
         data = self._data()
         try:
-            for i, off in enumerate(self._voffs[start:]):
-                out[i] = np.frombuffer(data, self._vdt, self.dim, off)
+            if self._cipher is not None:
+                for i, fid in enumerate(range(start, len(self._offsets))):
+                    off = self._offsets[fid]
+                    (n,) = _LEN.unpack_from(data, off)
+                    plain = self._plain(data[off + 4], bytes(data[off + 5 : off + 4 + n]), off)
+                    (jl,) = _JLEN.unpack_from(plain, 0)
+                    out[i] = np.frombuffer(plain, self._vdt, self.dim, 4 + jl)
+            else:
+                for i, off in enumerate(self._voffs[start:]):
+                    out[i] = np.frombuffer(data, self._vdt, self.dim, off)
         finally:
             if isinstance(data, mmap.mmap):
                 try:
@@ -447,9 +493,11 @@ class FrameStore:
 
     # records ------------------------------------------------------------------
     def _append_record(self, rtype: int, payload: bytes) -> int:
+        off = self._end
+        if self._cipher is not None and rtype != REC_SIGNATURE:
+            payload = self._cipher.seal(payload, rtype, off)
         body = bytes([rtype]) + payload
         rec = _LEN.pack(len(body)) + body + _CRC.pack(zlib.crc32(body))
-        off = self._end
         self._write(rec, off)
         self._end += len(rec)
         self._unsynced += 1
@@ -492,7 +540,7 @@ class FrameStore:
                 j, rtype = z, REC_FRAME_Z
         off = self._append_record(rtype, _JLEN.pack(len(j)) + j + v.astype(self._vdt).tobytes())
         self._offsets.append(off)
-        self._voffs.append(off + 4 + 1 + 4 + len(j))
+        self._voffs.append(off if self._cipher is not None else off + 4 + 1 + 4 + len(j))
         self._times.append(t)
         self.metas.append(meta or None)
         return Frame(fid, t, text, meta or {})
@@ -535,7 +583,8 @@ class FrameStore:
         body = raw[4:-4]
         if len(raw) != end - pos or zlib.crc32(body) != _CRC.unpack(raw[-4:])[0]:
             return None
-        return struct.unpack_from("<Q", body, 1)[0], body[9:]
+        plain = self._plain(REC_ANN, body[1:], pos)
+        return struct.unpack_from("<Q", plain, 0)[0], plain[8:]
 
     def is_live(self, fid: int, as_of: float | None = None) -> bool:
         d = self.deleted.get(fid)
@@ -548,7 +597,7 @@ class FrameStore:
         off = self._offsets[fid]
         head = self._read(off, 5)
         (n,) = _LEN.unpack_from(head)
-        payload = self._read(off + 5, n - 1)
+        payload = self._plain(head[4], self._read(off + 5, n - 1), off)
         jl = _JLEN.unpack_from(payload, 0)[0]
         raw = payload[4 : 4 + jl]
         rec = json.loads(zlib.decompress(raw) if head[4] == REC_FRAME_Z else raw)
@@ -571,6 +620,44 @@ class FrameStore:
         if self._fd is not None and not self.read_only:
             os.fsync(self._fd)
         self._unsynced = 0
+
+    def sign(self, key: bytes) -> None:
+        """Append an HMAC-SHA256 over every byte written so far (tamper evidence for the
+        prefix; later appends are reported as an unsigned tail by verify_signature)."""
+        self.sync()
+        mac = _crypto.hmac_sha256(key, self._chunks(self._end))
+        self._append_record(REC_SIGNATURE, mac)
+
+    def _chunks(self, upto: int, size: int = 1 << 20):
+        for off in range(0, upto, size):
+            yield self._read(off, min(size, upto - off))
+
+    def verify_signature(self, key: bytes) -> tuple[bool, int]:
+        """-> (valid, unsigned_trailing_bytes) for the LAST signature record; (False, ...)
+        if none exists or the signed prefix was modified."""
+        data = self._data()
+        try:
+            last, pos = None, self._pos0
+            while pos + 5 <= len(data):
+                (n,) = _LEN.unpack_from(data, pos)
+                end = pos + 4 + n + 4
+                if n < 1 or end > len(data):
+                    break
+                if data[pos + 4] == REC_SIGNATURE:
+                    last = (pos, end, bytes(data[pos + 5 : pos + 4 + n]))
+                pos = end
+            if last is None:
+                return False, len(data) - self._pos0
+            signed_end = last[0]
+            mac = _crypto.hmac_sha256(
+                key, (bytes(data[o : min(o + (1 << 20), signed_end)]) for o in range(0, signed_end, 1 << 20)))
+            return hmac.compare_digest(mac, last[2]), len(data) - last[1]
+        finally:
+            if isinstance(data, mmap.mmap):
+                try:
+                    data.close()
+                except BufferError:
+                    pass
 
     def verify(self) -> tuple[int, int]:
         """Re-read the whole file checking every CRC. Returns (records, bad_bytes)."""

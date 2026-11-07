@@ -18,12 +18,13 @@ from pathlib import Path
 
 import numpy as np
 
+from . import crypto
 from .store import (
     _CRC, _LEN, _TOMB, FLAG_VEC_F16, REC_ANN, REC_CHECKPOINT, REC_FRAME, REC_FRAME_Z,
-    REC_TOMBSTONE, FrameStore, read_header, _fsync_dir,
+    REC_SIGNATURE, REC_TOMBSTONE, FrameStore, read_header, _fsync_dir,
 )
 
-_KNOWN = (REC_FRAME, REC_TOMBSTONE, REC_CHECKPOINT, REC_ANN, REC_FRAME_Z)
+_KNOWN = (REC_FRAME, REC_TOMBSTONE, REC_CHECKPOINT, REC_ANN, REC_FRAME_Z, REC_SIGNATURE)
 _WINDOW = 1 << 24
 _POINTER_KEYS = ("supersedes", "source")
 
@@ -62,7 +63,7 @@ def _next_valid(data, start: int, size: int) -> int | None:
     while pos < size:
         hi = min(pos + _WINDOW, size)
         types = arr[pos + 4 : hi + 4 if hi + 4 <= size else size]
-        cand = np.flatnonzero((types >= 1) & (types <= 5)) + pos
+        cand = np.flatnonzero((types >= 1) & (types <= 6)) + pos
         for c in cand.tolist():
             if _try(data, c, size) is not None:  # length + type + CRC32 all check out
                 return c
@@ -90,20 +91,26 @@ def walk(data, pos0: int):
 def _header_end(path: str) -> int:
     h = read_header(path)
     n = struct.calcsize("<4sHHH") + len(h["name"].encode())
-    return n + (2 + len(h["spec"].encode()) + 4 if h["version"] >= 3 else 0)
+    if h["version"] >= 3:
+        n += 2 + len(h["spec"].encode()) + 4
+        if h["encrypted"]:
+            n += 2 + len(h["kdf"])
+    return n
 
 
-def diagnose(path: str | os.PathLike) -> Report:
-    return _run(str(path), None)
+def diagnose(path: str | os.PathLike, password: str | bytes | None = None) -> Report:
+    """Find damaged byte ranges. Works without the password for the damage map; frame and
+    tombstone counts need it for encrypted files."""
+    return _run(str(path), None, password)
 
 
 def repair(path: str | os.PathLike, dest: str | os.PathLike | None = None,
-           replace: bool = False) -> Report:
+           replace: bool = False, password: str | bytes | None = None) -> Report:
     """Write the salvaged file to dest (default `<path>.repaired`). With replace=True the
     damaged original is kept as `<path>.corrupt` and the repaired file takes its place."""
     path = str(path)
     dest = str(dest or path + ".repaired")
-    rep = _run(path, dest)
+    rep = _run(path, dest, password)
     if replace and rep.repaired_path:
         backup = path + ".corrupt"
         os.replace(path, backup)
@@ -113,8 +120,13 @@ def repair(path: str | os.PathLike, dest: str | os.PathLike | None = None,
     return rep
 
 
-def _run(path: str, dest: str | None) -> Report:
+def _run(path: str, dest: str | None, password=None) -> Report:
     h = read_header(path)
+    cipher = None
+    if h["encrypted"] and password is not None:
+        cipher = crypto.open_kdf_block(h["kdf"], password)
+    if h["encrypted"] and cipher is None and dest:
+        raise crypto.EncryptedFileError("repairing an encrypted file needs the password")
     pos0 = _header_end(path)
     vsz = h["dim"] * (2 if h["flags"] & FLAG_VEC_F16 else 4)
     vdt = np.float16 if h["flags"] & FLAG_VEC_F16 else np.float32
@@ -123,7 +135,8 @@ def _run(path: str, dest: str | None) -> Report:
     if dest:
         if os.path.exists(dest):
             os.unlink(dest)
-        out = FrameStore(dest, h["dim"], h["name"], spec=h["spec"], flags=h["flags"], sync="never")
+        out = FrameStore(dest, h["dim"], h["name"], spec=h["spec"], flags=h["flags"] & ~2,
+                         password=password if h["encrypted"] else None, sync="never")
     idmap: dict[int, int] = {}
     seen_frames = 0
     max_id = -1
@@ -139,6 +152,10 @@ def _run(path: str, dest: str | None) -> Report:
                 rep.records_ok += 1
                 rtype = data[a + 4]
                 body = bytes(data[a + 4 : b - 4])
+                if h["encrypted"] and cipher is None:
+                    continue  # damage map only: payloads cannot be read without the password
+                if cipher is not None and rtype in (REC_FRAME, REC_FRAME_Z, REC_TOMBSTONE):
+                    body = bytes([rtype]) + cipher.unseal(body[1:], rtype, a)
                 if rtype in (REC_FRAME, REC_FRAME_Z):
                     jl = struct.unpack_from("<I", body, 1)[0]
                     if len(body) != 1 + 4 + jl + vsz:

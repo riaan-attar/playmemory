@@ -69,6 +69,7 @@ class Memory:
         sync_every: int = 100,
         vec_dtype: str = "float32",
         auto_refresh: bool = False,
+        password: str | bytes | None = None,
         max_text_bytes: int = MAX_TEXT_BYTES,
         max_meta_bytes: int = MAX_META_BYTES,
     ):
@@ -91,6 +92,7 @@ class Memory:
         self.read_only = read_only
         if vec_dtype not in ("float32", "float16"):
             raise ValueError("vec_dtype must be float32 or float16")
+        self._password = password
         self._flags = FLAG_VEC_F16 if vec_dtype == "float16" else 0
         self.auto_refresh = auto_refresh and read_only
         self.ann_threshold = ann_threshold
@@ -105,6 +107,7 @@ class Memory:
         self.store = FrameStore(
             self.path, self.embedder.dim, self.embedder.name,
             spec=getattr(self.embedder, "spec", self.embedder.name), flags=self._flags,
+            password=self._password,
             read_only=self.read_only, sync=self._sync, sync_every=self._sync_every,
         )
         self.index = VectorMatrix(self.embedder.dim)
@@ -168,7 +171,9 @@ class Memory:
         texts: list[str],
         metas: list[dict | None] | None = None,
         times: list[float | None] | None = None,
+        vectors: np.ndarray | None = None,
     ) -> list[Frame]:
+        """Add frames. `vectors` (n, dim) skips embedding the texts (precomputed/cached/image vectors)."""
         import json
 
         for i, text in enumerate(texts):
@@ -176,7 +181,9 @@ class Memory:
                 raise ValueError(f"text {i} exceeds {self.max_text_bytes} bytes")
             if metas and metas[i] and len(json.dumps(metas[i])) > self.max_meta_bytes:
                 raise ValueError(f"meta {i} exceeds {self.max_meta_bytes} bytes")
-        vecs = self.embedder.embed(texts)
+        vecs = self.embedder.embed(texts) if vectors is None else np.asarray(vectors, dtype=np.float32)
+        if vecs.shape != (len(texts), self.embedder.dim):
+            raise ValueError(f"vectors must have shape ({len(texts)}, {self.embedder.dim})")
         return self._append(texts, metas, times, vecs)
 
     def _append(self, texts, metas, times, vecs) -> list[Frame]:
@@ -197,6 +204,19 @@ class Memory:
         if self.ann is not None:
             self.ann.add(vecs)
         return frames
+
+    @_writes
+    def add_images(self, paths: list[str], captions: list[str | None] | None = None,
+                   metas: list[dict | None] | None = None, times: list[float | None] | None = None) -> list[Frame]:
+        """Add images as frames: the vector is the image embedding (needs an embedder with
+        `embed_images`, e.g. ClipEmbedder); the searchable text is the caption or file name."""
+        if not hasattr(self.embedder, "embed_images"):
+            raise TypeError("this embedder cannot embed images; use ClipEmbedder (playmemory[images])")
+        paths = [str(p) for p in paths]
+        texts = [(captions[i] if captions and captions[i] else Path(p).name) for i, p in enumerate(paths)]
+        metas = [{**(metas[i] or {} if metas else {}), "kind": "image", "source": str(Path(p).resolve())}
+                 for i, p in enumerate(paths)]
+        return self.add_many(texts, metas, times, vectors=self.embedder.embed_images(paths))
 
     @_writes
     def forget(self, fid: int, t: float | None = None) -> None:
@@ -256,6 +276,16 @@ class Memory:
 
     # durability ---------------------------------------------------------------
     @_writes
+    def sign(self, key: bytes | str) -> None:
+        """Append an HMAC-SHA256 signature over everything written so far."""
+        self.store.sign(key.encode() if isinstance(key, str) else key)
+
+    @_locked
+    def verify_signature(self, key: bytes | str) -> tuple[bool, int]:
+        """(valid, unsigned trailing bytes) for the last signature in the file."""
+        return self.store.verify_signature(key.encode() if isinstance(key, str) else key)
+
+    @_writes
     def commit(self) -> None:
         """Group commit: fsync everything written so far."""
         self.store.sync()
@@ -292,7 +322,7 @@ class Memory:
             tmp.unlink()
         new = Memory(tmp, self.embedder, vec_dtype="float16" if self._flags & FLAG_VEC_F16 else "float32",
                      ann_threshold=self.ann_threshold, episode_config=self.episode_config,
-                     sync="never")
+                     password=self._password, sync="never")
         vecs = self.index.vectors[keep] if keep else np.zeros((0, self.embedder.dim), np.float32)
         for k, old in enumerate(keep):
             f = s.get(old)
@@ -616,6 +646,7 @@ class Memory:
             "dropped_bytes_on_open": s.dropped_bytes,
             "episodes": len(self.episodes),
             "ann": self.ann is not None,
+            "encrypted": self.store._cipher is not None,
             "embedder": self.embedder.name,
             "dim": self.embedder.dim,
         }

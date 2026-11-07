@@ -28,6 +28,7 @@ ann = ["faiss-cpu"]                    # HNSW for very large memories
 bench = ["faiss-cpu"]
 docs = ["pypdf>=4", "python-docx>=1.1", "openpyxl>=3.1", "python-pptx>=1.0"]
 audio = ["faster-whisper"]
+images = ["sentence-transformers", "pillow"]
 all = ["onnxruntime", "tokenizers", "faiss-cpu", "pypdf>=4", "python-docx>=1.1", "openpyxl>=3.1", "python-pptx>=1.0"]
 dev = ["pytest", "build", "twine"]
 
