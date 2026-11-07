@@ -3,15 +3,40 @@ from __future__ import annotations
 import json
 import math
 import re
+import unicodedata
 from array import array
 
 import numpy as np
 
-_TOKEN = re.compile(r"[a-z0-9]+")
+TOKENIZER_VERSION = 2  # bump when tokenize() changes; checkpoints with another version are rebuilt
+
+_WORD = re.compile(r"\w+")
+# Scripts written without spaces: index overlapping character bigrams instead of words.
+_CJK_RUN = re.compile(r"[\u3040-\u30ff\u31f0-\u31ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]+")
+
+
+def _fold_accents(tok: str) -> str:
+    """cafe == café, but only for Latin-script words (marks are meaningful elsewhere)."""
+    if tok.isascii() or not unicodedata.name(tok[0], "").startswith("LATIN"):
+        return tok
+    d = unicodedata.normalize("NFD", tok)
+    return unicodedata.normalize("NFC", "".join(c for c in d if unicodedata.category(c) != "Mn"))
 
 
 def tokenize(text: str) -> list[str]:
-    return _TOKEN.findall(text.lower())
+    """Unicode-aware tokens: NFKC + casefold, Latin accents folded, CJK/Hangul as bigrams."""
+    out: list[str] = []
+    for word in _WORD.findall(unicodedata.normalize("NFKC", text).casefold()):
+        pos = 0
+        for m in _CJK_RUN.finditer(word):
+            if m.start() > pos:
+                out.append(_fold_accents(word[pos : m.start()]))
+            run = m.group()
+            out.extend([run] if len(run) == 1 else (run[i : i + 2] for i in range(len(run) - 1)))
+            pos = m.end()
+        if pos < len(word):
+            out.append(_fold_accents(word[pos:]))
+    return out
 
 
 class BM25Index:
@@ -93,6 +118,7 @@ class BM25Index:
             "bm_ids": ids.copy(),
             "bm_tf": tfs.copy(),
             "bm_len": np.frombuffer(self.doc_len, np.int32).copy(),
+            "bm_tokver": np.asarray([TOKENIZER_VERSION], dtype=np.int32),
         }
 
     @classmethod

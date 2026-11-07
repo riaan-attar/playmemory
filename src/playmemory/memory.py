@@ -11,12 +11,12 @@ from typing import Any
 import numpy as np
 
 from .ann import AnnIndex
-from .embed import Embedder, HashEmbedder
+from .embed import Embedder, HashEmbedder, from_spec
 from .episodes import EpisodeConfig, EpisodeIndex
 from .frame import Frame, Hit, Span
 from .index import SegmentIndex
-from .lexical import BM25Index, tokenize
-from .store import FrameStore, _fsync_dir
+from .lexical import TOKENIZER_VERSION, BM25Index, tokenize
+from .store import FrameStore, _fsync_dir, read_header
 
 RRF_K = 60
 MAX_TEXT_BYTES = 1 << 20  # 1 MiB per frame
@@ -56,7 +56,7 @@ class Memory:
     def __init__(
         self,
         path: str | os.PathLike | None = None,
-        embedder: Embedder | None = None,
+        embedder: Embedder | str | None = None,
         segment_size: int = 64,
         approx: bool = False,
         *,
@@ -69,6 +69,10 @@ class Memory:
         max_meta_bytes: int = MAX_META_BYTES,
     ):
         self.path = Path(path) if path else None
+        if isinstance(embedder, str):
+            embedder = from_spec(embedder)
+        if embedder is None and path is not None and Path(path).exists() and Path(path).stat().st_size:
+            embedder = from_spec(read_header(path)["spec"])  # reopen with the embedder the file was built with
         if embedder is None:
             import warnings
 
@@ -93,6 +97,7 @@ class Memory:
     def _open(self) -> None:
         self.store = FrameStore(
             self.path, self.embedder.dim, self.embedder.name,
+            spec=getattr(self.embedder, "spec", self.embedder.name),
             read_only=self.read_only, sync=self._sync, sync_every=self._sync_every,
         )
         self.index = SegmentIndex(
@@ -100,7 +105,10 @@ class Memory:
             exact_below=2048 if self.approx else 1 << 62,
         )
         cp = self.store.checkpoint_arrays
-        self.bm25 = BM25Index.from_arrays(cp) if cp is not None else BM25Index()
+        bm_ok = cp is not None and "bm_tokver" in cp and int(cp["bm_tokver"][0]) == TOKENIZER_VERSION
+        self.bm25 = BM25Index.from_arrays(cp) if bm_ok else BM25Index()
+        if cp is not None and not bm_ok:  # tokenizer changed since the checkpoint: re-index all texts
+            self.store.tail_texts = [(i, self.store.get(i).text) for i in range(len(self.store))]
         self.episodes = (EpisodeIndex.from_arrays(cp, self.episode_config)
                          if cp is not None and "ep_starts" in cp else EpisodeIndex(self.episode_config))
         for fid, text in self.store.tail_texts:

@@ -11,7 +11,8 @@ _TOKEN = re.compile(r"[a-z0-9]+")
 
 class Embedder(Protocol):
     dim: int
-    name: str
+    name: str  # identity used to bind a file to its embedder
+    spec: str  # string from_spec() can rebuild this embedder from (never contains secrets)
 
     def embed(self, texts: list[str]) -> np.ndarray:
         """Return an (n, dim) float32 array of L2-normalised vectors."""
@@ -27,7 +28,7 @@ class HashEmbedder:
 
     def __init__(self, dim: int = 256):
         self.dim = dim
-        self.name = f"hash-{dim}"
+        self.name = self.spec = f"hash-{dim}"
 
     def embed(self, texts: list[str]) -> np.ndarray:
         out = np.zeros((len(texts), self.dim), dtype=np.float32)
@@ -48,6 +49,7 @@ class SentenceTransformerEmbedder:
 
         self._model = SentenceTransformer(model)
         self.name = model
+        self.spec = f"st:{model}"
         self.dim = self._model.get_sentence_embedding_dimension()
 
     def embed(self, texts: list[str]) -> np.ndarray:
@@ -70,6 +72,11 @@ class HTTPEmbedder:
         self.url, self.model, self.api_key = url, model, api_key
         self.batch, self.timeout = batch, timeout
         self.name = f"http:{model}"
+        self.spec = f"http:{url}|{model}"
+        if api_key is None:
+            import os
+
+            self.api_key = os.environ.get("PLAYMEMORY_API_KEY")
         self.dim = dim if dim is not None else self.embed(["dimension probe"]).shape[1]
 
     def _post(self, texts: list[str]) -> list[list[float]]:
@@ -120,7 +127,7 @@ class OnnxEmbedder:
         self._tok.enable_truncation(max_len)
         self._tok.enable_padding()
         self.pooling = pooling
-        self.name = f"onnx:{repo}"
+        self.name = self.spec = f"onnx:{repo}"
         self.dim = int(self._sess.get_outputs()[0].shape[-1])
 
     @classmethod
@@ -158,7 +165,7 @@ class OnnxEmbedder:
         return arr / norms
 
 
-def from_spec(spec: str) -> Embedder:
+def from_spec(spec: str, api_key: str | None = None) -> Embedder:
     """Build an embedder from a short spec: hash[-DIM] | onnx[:REPO] | st[:MODEL] |
     http:URL|MODEL[|APIKEY]."""
     kind, _, rest = spec.partition(":")
@@ -167,6 +174,8 @@ def from_spec(spec: str) -> Embedder:
         return HashEmbedder(dim)
     if kind == "onnx":
         return OnnxEmbedder(rest) if rest else OnnxEmbedder()
+    if "/" in spec and ":" not in spec:  # bare sentence-transformers model id (older files)
+        return SentenceTransformerEmbedder(spec)
     if kind == "st":
         return SentenceTransformerEmbedder(rest) if rest else SentenceTransformerEmbedder()
     if kind == "http":
@@ -174,5 +183,5 @@ def from_spec(spec: str) -> Embedder:
         parts = rest.split("|")
         if len(parts) < 2:
             raise ValueError("http spec is http:URL|MODEL[|APIKEY]")
-        return HTTPEmbedder(parts[0], parts[1], parts[2] if len(parts) > 2 else None)
+        return HTTPEmbedder(parts[0], parts[1], parts[2] if len(parts) > 2 else api_key)
     raise ValueError(f"unknown embedder spec {spec!r}")

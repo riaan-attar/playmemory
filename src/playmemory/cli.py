@@ -9,27 +9,16 @@ import warnings
 
 from .embed import HashEmbedder, from_spec
 from .memory import Memory
-from .store import FrameStore
-
-
-def _peek_embedder_name(path: str) -> tuple[str, int]:
-    import struct
-
-    with open(path, "rb") as f:
-        head = f.read(10)
-        magic, _ver, dim, nlen = struct.unpack("<4sHHH", head)
-        return f.read(nlen).decode(), dim
+from .store import FrameStore, read_header
 
 
 def _open(args, read_only=False) -> Memory:
-    spec = args.embedder
-    if spec is None:
+    emb = from_spec(args.embedder, args.api_key) if args.embedder else None
+    if emb is None:
         try:
-            name, dim = _peek_embedder_name(args.file)
+            emb = from_spec(read_header(args.file)["spec"], args.api_key)
         except FileNotFoundError:
-            name, dim = "hash-256", 256
-        spec = name if name.startswith("hash") else name.replace("onnx:", "onnx:", 1)
-    emb = from_spec(spec)
+            emb = HashEmbedder()  # brand-new file: debug embedder unless --embedder given
     return Memory(args.file, emb, read_only=read_only)
 
 
@@ -47,6 +36,7 @@ def _print(obj):
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="playmemory", description="Timeline memory for AI systems")
     ap.add_argument("file", help="memory file (.pmem)")
+    ap.add_argument("--api-key", default=None, help="key for http: embedders (or env PLAYMEMORY_API_KEY)")
     ap.add_argument("--embedder", help="hash[-DIM] | onnx[:REPO] | st[:MODEL] | http:URL|MODEL[|KEY] "
                     "(default: the one the file was created with)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -85,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         if args.cmd == "verify":
-            st = FrameStore(args.file, _peek_embedder_name(args.file)[1], read_only=True)
+            st = FrameStore(args.file, read_header(args.file)["dim"], read_only=True)
             records, bad = st.verify()
             _print({"records": records, "bad_bytes": bad, "ok": bad == 0})
             return 0 if bad == 0 else 2

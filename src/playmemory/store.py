@@ -6,6 +6,7 @@ import json
 import mmap
 import os
 import struct
+import threading
 import zlib
 from pathlib import Path
 
@@ -14,8 +15,11 @@ import numpy as np
 from .frame import Frame
 
 MAGIC = b"PMEM"
-VERSION = 2
+VERSION = 3  # v3 = v2 + embedder spec + flags in the header; record formats are identical
+READ_VERSIONS = (2, 3)
 _HDR = struct.Struct("<4sHHH")  # magic, version, dim, name_len
+_SPEC = struct.Struct("<H")
+_FLAGS = struct.Struct("<I")
 _LEN = struct.Struct("<I")
 _CRC = struct.Struct("<I")
 _TOMB = struct.Struct("<Qd")  # frame id, time of deletion
@@ -25,6 +29,37 @@ REC_FRAME = 1
 REC_TOMBSTONE = 2
 REC_CHECKPOINT = 3  # derived index state; safe to ignore or drop (compaction)
 REC_ANN = 4  # serialized ANN graph: u64 frames covered | blob (derived, droppable)
+
+
+_HAS_PREAD = hasattr(os, "pread")  # absent on Windows; tests flip this to exercise the fallback
+_SEEK_LOCK = threading.Lock()
+_O_BINARY = getattr(os, "O_BINARY", 0)
+
+
+def _pread(fd: int, n: int, off: int) -> bytes:
+    if _HAS_PREAD:
+        return os.pread(fd, n, off)
+    with _SEEK_LOCK:
+        os.lseek(fd, off, os.SEEK_SET)
+        return os.read(fd, n)
+
+
+def _pwrite(fd: int, data: bytes, off: int) -> None:
+    """Write all of data at off (handles short writes)."""
+    view = memoryview(data)
+    with _SEEK_LOCK if not _HAS_PREAD else _NullLock():
+        while view:
+            if _HAS_PREAD:
+                n = os.pwrite(fd, view, off)
+            else:
+                os.lseek(fd, off, os.SEEK_SET)
+                n = os.write(fd, view)
+            view, off = view[n:], off + n
+
+
+class _NullLock:
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
 
 
 class ModelMismatchError(ValueError):
@@ -50,11 +85,29 @@ def _try_lock(fd: int) -> None:
     except ImportError:  # Windows
         import msvcrt
 
-        try:
-            os.lseek(fd, 0, os.SEEK_SET)
+        try:  # lock a byte far past EOF so readers can still read the real data
+            os.lseek(fd, 1 << 40, os.SEEK_SET)
             msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
         except OSError as e:
             raise LockedError("file is locked by another writer") from e
+
+
+def read_header(path: str | os.PathLike) -> dict:
+    """Parse just the header: {version, dim, name, spec, flags}."""
+    with open(path, "rb") as f:
+        head = f.read(_HDR.size)
+        if len(head) < _HDR.size:
+            raise CorruptFileError("truncated header")
+        magic, ver, dim, nlen = _HDR.unpack(head)
+        if magic != MAGIC:
+            raise CorruptFileError("not a PlayMemory file")
+        name = f.read(nlen).decode()
+        spec, flags = name, 0
+        if ver >= 3:
+            (slen,) = _SPEC.unpack(f.read(2))
+            spec = f.read(slen).decode()
+            (flags,) = _FLAGS.unpack(f.read(4))
+    return {"version": ver, "dim": dim, "name": name, "spec": spec, "flags": flags}
 
 
 def _fsync_dir(path: Path) -> None:
@@ -94,6 +147,8 @@ class FrameStore:
         dim: int,
         model: str = "",
         *,
+        spec: str = "",
+        flags: int = 0,
         read_only: bool = False,
         sync: str = "batch",
         sync_every: int = 0,
@@ -103,6 +158,9 @@ class FrameStore:
         self.path = Path(path) if path else None
         self.dim = dim
         self.model = model
+        self.spec = spec
+        self.flags = flags
+        self.version = VERSION
         self.read_only = read_only
         self.sync_mode = sync
         self.sync_every = sync_every
@@ -123,25 +181,32 @@ class FrameStore:
         created = False
         if self.path:
             if read_only:
-                self._fd = os.open(self.path, os.O_RDONLY)
+                self._fd = os.open(self.path, os.O_RDONLY | _O_BINARY)
             else:
-                self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT)
+                self._fd = os.open(self.path, os.O_RDWR | os.O_CREAT | _O_BINARY)
                 try:
                     _try_lock(self._fd)
                 except Exception:
                     os.close(self._fd)
                     self._fd = None
                     raise
-        if self._size() == 0:
-            if read_only:
-                raise CorruptFileError("empty file")
-            name = model.encode()
-            self._write(_HDR.pack(MAGIC, VERSION, dim, len(name)) + name, 0)
-            created = True
-        self._end = self._scan()
-        if created and self._fd is not None:
-            os.fsync(self._fd)
-            _fsync_dir(self.path)
+        try:
+            if self._size() == 0:
+                if read_only:
+                    raise CorruptFileError("empty file")
+                name, sp = model.encode(), (spec or model).encode()
+                self._write(_HDR.pack(MAGIC, VERSION, dim, len(name)) + name
+                            + _SPEC.pack(len(sp)) + sp + _FLAGS.pack(flags), 0)
+                created = True
+            self._end = self._scan()
+            if created and self._fd is not None:
+                os.fsync(self._fd)
+                _fsync_dir(self.path)
+        except BaseException:  # a failed open must not leave the file locked
+            if self._fd is not None:
+                os.close(self._fd)
+                self._fd = None
+            raise
 
     # raw io ---------------------------------------------------------------
     def _size(self) -> int:
@@ -149,14 +214,14 @@ class FrameStore:
 
     def _read(self, off: int, n: int) -> bytes:
         if self._fd is not None:
-            return os.pread(self._fd, n, off)
+            return _pread(self._fd, n, off)
         return bytes(self._buf[off : off + n])
 
     def _write(self, data: bytes, off: int) -> None:
         if self.read_only:
             raise PermissionError("store opened read-only")
         if self._fd is not None:
-            os.pwrite(self._fd, data, off)
+            _pwrite(self._fd, data, off)
         else:
             self._buf[off : off + len(data)] = data
 
@@ -193,10 +258,11 @@ class FrameStore:
         magic, ver, dim, nlen = _HDR.unpack_from(data, 0)
         if magic != MAGIC:
             raise CorruptFileError("not a PlayMemory file")
-        if ver != VERSION:
+        if ver not in READ_VERSIONS:
             raise CorruptFileError(
-                f"unsupported file version {ver} (this build reads {VERSION})"
+                f"unsupported file version {ver} (this build reads {READ_VERSIONS})"
             )
+        self.version = ver
         model = bytes(data[_HDR.size : _HDR.size + nlen]).decode()
         if dim != self.dim or (self.model and model and model != self.model):
             raise ModelMismatchError(
@@ -205,6 +271,14 @@ class FrameStore:
             )
         self.model = model or self.model
         pos0 = _HDR.size + nlen
+        if ver >= 3:
+            (slen,) = _SPEC.unpack_from(data, pos0)
+            self.spec = bytes(data[pos0 + 2 : pos0 + 2 + slen]).decode()
+            (self.flags,) = _FLAGS.unpack_from(data, pos0 + 2 + slen)
+            pos0 += 2 + slen + 4
+        else:
+            self.spec = self.spec or model
+        self._pos0 = pos0  # offset of the first record
 
         # 1) hop the length chain to find the last checkpoint (no CRC work)
         cp = None
@@ -435,8 +509,7 @@ class FrameStore:
         data = self._data()
         try:
             size = len(data)
-            _, _, _, nlen = _HDR.unpack_from(data, 0)
-            pos, count = _HDR.size + nlen, 0
+            pos, count = self._pos0, 0
             while pos + 4 <= size:
                 (n,) = _LEN.unpack_from(data, pos)
                 end = pos + 4 + n + 4
