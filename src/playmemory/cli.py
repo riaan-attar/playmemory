@@ -32,6 +32,31 @@ def _open(args, read_only=False) -> Memory:
     return Memory(args.file, emb, read_only=read_only)
 
 
+def _reranker():
+    from .rerank import OnnxCrossEncoder
+
+    return OnnxCrossEncoder()
+
+
+def _cutoff(spec):
+    if not spec or spec == "elbow":
+        return spec or None
+    kind, _, x = spec.partition(":")
+    return (kind, float(x))
+
+
+def _synth(spec: str):
+    from .ask import ClaudeSynthesizer, OpenAICompatSynthesizer
+
+    kind, _, rest = spec.partition(":")
+    if kind == "claude":
+        return ClaudeSynthesizer(rest) if rest else ClaudeSynthesizer()
+    if kind == "openai":
+        model, _, url = rest.partition("@")
+        return OpenAICompatSynthesizer(model, url) if url else OpenAICompatSynthesizer(model)
+    raise SystemExit(f"unknown --llm {spec!r}")
+
+
 def _frame_dict(f, score=None):
     d = {"id": f.id, "t": f.t, "text": f.text, "meta": f.meta}
     if score is not None:
@@ -63,6 +88,16 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--as-of", type=float)
     s.add_argument("--where", help="JSON object")
     s.add_argument("--recency", type=float, help="half-life in seconds")
+    s.add_argument("--when", help='time filter: "auto" (read it from the query), or a phrase like "last week"')
+    s.add_argument("--rerank", action="store_true", help="rescore top candidates with the local ONNX cross-encoder")
+    s.add_argument("--cutoff", help='adaptive count: elbow | ratio:0.5 | cliff:0.4 | min:0.3')
+    q = sub.add_parser("ask", help="answer a question from memory with an LLM, with citations")
+    q.add_argument("question")
+    q.add_argument("--llm", default="claude", help="claude[:MODEL] (ANTHROPIC_API_KEY) | openai:MODEL[@URL] (OPENAI_API_KEY)")
+    q.add_argument("-k", type=int, default=8)
+    q.add_argument("--budget", type=int, default=6000)
+    q.add_argument("--spans", action="store_true", help="give the model contiguous scenes instead of top-k hits")
+    q.add_argument("--when")
     st = sub.add_parser("story", help="return the timeline span(s) that cover a query")
     st.add_argument("query")
     st.add_argument("-k", type=int, default=1, help="number of spans")
@@ -100,7 +135,7 @@ def main(argv: list[str] | None = None) -> int:
             rep = repair(args.file, replace=args.replace) if args.write or args.replace else diagnose(args.file)
             _print(asdict(rep))
             return 0 if rep.ok else 2
-        read_only = args.cmd in ("search", "story", "read", "seek", "window", "stats", "export")
+        read_only = args.cmd in ("search", "ask", "story", "read", "seek", "window", "stats", "export")
         m = _open(args, read_only)
     try:
         if args.cmd == "add":
@@ -113,13 +148,19 @@ def main(argv: list[str] | None = None) -> int:
         elif args.cmd == "search":
             hits = m.search(args.query, args.k, args.context, mode=args.mode, as_of=args.as_of,
                             where=json.loads(args.where) if args.where else None,
-                            recency_half_life=args.recency)
+                            recency_half_life=args.recency, when=args.when,
+                            rerank=_reranker() if args.rerank else None, cutoff=_cutoff(args.cutoff))
             for h in hits:
                 d = _frame_dict(h.frame, h.score)
                 if args.context:
                     d["before"] = [_frame_dict(x) for x in h.before]
                     d["after"] = [_frame_dict(x) for x in h.after]
                 _print(d)
+        elif args.cmd == "ask":
+            ans = m.ask(args.question, _synth(args.llm), k=args.k, budget_chars=args.budget,
+                        spans=args.spans, when=args.when)
+            _print({"answer": ans.text, "citations": [_frame_dict(f) for f in ans.citations],
+                    "context_frames": [f.id for f in ans.context]})
         elif args.cmd == "story":
             for sp in m.recall_span(args.query, args.k, args.budget, as_of=args.as_of):
                 d = {"start_id": sp.start_id, "end_id": sp.end_id, "t0": sp.t0, "t1": sp.t1,

@@ -58,3 +58,26 @@ def test_cli_story_and_read(tmp_path, capsys, monkeypatch):
     assert "frames" not in out[0]
     code, out = run(capsys, f, "read", str(sp["start_id"]), str(sp["end_id"]))
     assert [o["id"] for o in out] == [x["id"] for x in sp["frames"]]
+
+
+def test_cli_search_when_and_cutoff(tmp_path, capsys, monkeypatch):
+    f = str(tmp_path / "w.pmem")
+    run(capsys, f, "add", "--t", "1680426000", "standup april", stdin=None)
+    run(capsys, f, "add", "--t", "1683014400", "standup may", stdin=None)  # 2023-05-02
+    code, out = run(capsys, f, "search", "standup", "--mode", "lexical", "--when", "in May 2023")
+    assert [o["text"] for o in out] == ["standup may"]
+    code, out = run(capsys, f, "search", "standup", "--mode", "lexical", "--cutoff", "ratio:0.99", "-k", "5")
+    assert len(out) >= 1
+
+
+def test_server_recall_accepts_when():
+    from playmemory import Memory
+    from playmemory.server import MemoryServer
+    from test_server import call
+
+    srv = MemoryServer(Memory(embedder="debug"))
+    srv.mem.add("meeting notes", t=1683014400.0)
+    hits, err = call(srv, "recall", query="meeting", when="in May 2023", mode="lexical")
+    assert not err and len(hits) == 1
+    hits, err = call(srv, "recall", query="meeting", when="in March 2023", mode="lexical")
+    assert hits == []

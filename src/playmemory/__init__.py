@@ -3,6 +3,9 @@ from .embed import (
     SentenceTransformerEmbedder, from_spec,
 )
 from .episodes import EpisodeConfig
+from .ask import Answer, ClaudeSynthesizer, OpenAICompatSynthesizer
+from .rerank import LLMReranker, OnnxCrossEncoder, Reranker
+from .temporal import parse_time_range
 from .frame import Frame, Hit, Span
 from .memory import Memory
 from .store import CorruptFileError, LockedError, ModelMismatchError
@@ -10,7 +13,8 @@ from .store import CorruptFileError, LockedError, ModelMismatchError
 __version__ = "0.3.0"
 
 __all__ = [
-    "Memory", "Frame", "Hit", "Span", "EpisodeConfig", "Embedder", "DebugEmbedder", "HashEmbedder", "HTTPEmbedder",
+    "Memory", "Answer", "ClaudeSynthesizer", "OpenAICompatSynthesizer", "Reranker", "OnnxCrossEncoder",
+    "LLMReranker", "parse_time_range", "Frame", "Hit", "Span", "EpisodeConfig", "Embedder", "DebugEmbedder", "HashEmbedder", "HTTPEmbedder",
     "OnnxEmbedder", "SentenceTransformerEmbedder", "from_spec",
     "CorruptFileError", "LockedError", "ModelMismatchError",
 ]

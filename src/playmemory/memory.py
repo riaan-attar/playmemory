@@ -11,11 +11,13 @@ from typing import Any
 import numpy as np
 
 from .ann import AnnIndex
+from .cutoff import keep_count
 from .embed import Embedder, HashEmbedder, from_spec
 from .episodes import EpisodeConfig, EpisodeIndex
 from .frame import Frame, Hit, Span
 from .index import VectorMatrix
 from .lexical import TOKENIZER_VERSION, BM25Index, tokenize
+from .temporal import parse_time_range
 from .store import FLAG_VEC_F16, FileChangedError, FrameStore, _fsync_dir, read_header
 
 RRF_K = 60
@@ -308,9 +310,15 @@ class Memory:
         return {"bytes_before": before, "bytes_after": self.store.nbytes, "frames": len(keep)}
 
     # reading ------------------------------------------------------------------
-    def _mask(self, as_of: float | None, where: dict[str, Any] | None) -> np.ndarray:
+    def _mask(self, as_of: float | None, where: dict[str, Any] | None,
+              window: tuple[float, float] | None = None) -> np.ndarray:
         n = len(self.store)
         mask = np.ones(n, dtype=bool)
+        if window is not None:  # keep frames with window[0] <= t < window[1]
+            lo = bisect.bisect_left(self.store.times, window[0])
+            hi = bisect.bisect_left(self.store.times, window[1])
+            mask[:lo] = False
+            mask[hi:] = False
         d = self._del_np[:n]
         if as_of is None:
             mask &= ~np.isfinite(d)
@@ -341,23 +349,38 @@ class Memory:
         recency_half_life: float | None = None,
         pool: int = 50,
         exact: bool = False,
+        when: str | tuple[float, float] | None = None,
+        now: float | None = None,
+        rerank: Any = None,
+        rerank_pool: int = 30,
+        cutoff: Any = None,
     ) -> list[Hit]:
         """Top-k frames. mode: hybrid | vector | lexical.
 
         as_of: query the memory as it was at that time (later frames and later
         deletions are invisible). where: exact-match filter on frame meta.
         recency_half_life: multiply scores by 0.5**(age/half_life).
+        when: restrict to a time range: (t0, t1), a phrase like "last week" / "in May 2023",
+        or "auto" to read one out of the query itself (relative to `now`, default wall clock).
+        rerank: a Reranker rescoring the top `rerank_pool` candidates.
+        cutoff: adaptive result count, see playmemory.cutoff ("elbow", ("ratio", .5), ...).
         """
-        ranked = self._rank(query, mode, as_of, where, recency_half_life, pool, exact)
+        ranked = self._rank(query, mode, as_of, where, recency_half_life, pool, exact,
+                            when=when, now=now, rerank=rerank, rerank_pool=rerank_pool)
+        if cutoff is not None:
+            ranked = ranked[: keep_count([sc for _, sc in ranked[:k]], cutoff)]
         return [self._hit(fid, score, context, as_of) for fid, score in ranked[:k]]
 
     def _rank(self, query: str, mode: str, as_of: float | None, where: dict[str, Any] | None,
-              recency_half_life: float | None, pool: int, exact: bool) -> list[tuple[int, float]]:
+              recency_half_life: float | None, pool: int, exact: bool, *,
+              when=None, now: float | None = None, rerank=None,
+              rerank_pool: int = 30) -> list[tuple[int, float]]:
         """Ranked (frame id, score) candidates, best first, at most ~pool of them."""
         n = len(self.store)
         if n == 0:
             return []
-        mask = self._mask(as_of, where)
+        window = self._window(when, query, now)
+        mask = self._mask(as_of, where, window)
         ranked: list[tuple[int, float]]
         vec_hits: list[tuple[int, float]] = []
         lex_hits: list[tuple[int, float]] = []
@@ -390,7 +413,21 @@ class Memory:
             ranked = [(f, s * 0.5 ** (max(ref - times[f], 0) / recency_half_life))
                       for f, s in ranked]
         ranked.sort(key=lambda x: -x[1])
+        if rerank is not None and ranked:
+            head, tail = ranked[:rerank_pool], ranked[rerank_pool:]
+            scores = rerank.score(query, [self.store.get(f).text for f, _ in head])
+            head = sorted(((f, float(sc)) for (f, _), sc in zip(head, scores)), key=lambda x: -x[1])
+            floor = head[-1][1]  # keep reranked candidates above the un-reranked tail
+            ranked = head + [(f, min(sc, floor) - 1e-6 * (i + 1)) for i, (f, sc) in enumerate(tail)]
         return ranked
+
+    def _window(self, when, query: str, now: float | None):
+        if when is None:
+            return None
+        now = time.time() if now is None else now
+        if isinstance(when, tuple):
+            return when
+        return parse_time_range(query if when == "auto" else when, now)
 
     def _exact_vec(self, q: np.ndarray, mask: np.ndarray, pool: int, visible: int):
         scores = self.index.vectors @ q
@@ -428,7 +465,9 @@ class Memory:
     @_locked
     def recall_span(self, query: str, k: int = 1, budget_chars: int = 4000, *,
                     mode: str = "hybrid", as_of: float | None = None,
-                    where: dict[str, Any] | None = None, pool: int = 50) -> list[Span]:
+                    where: dict[str, Any] | None = None, pool: int = 50,
+                    when=None, now: float | None = None, rerank: Any = None,
+                    rerank_pool: int = 30) -> list[Span]:
         """Return up to k contiguous timeline spans ("watch from A to B") that
         best cover the query, each trimmed to its share of budget_chars.
 
@@ -438,7 +477,8 @@ class Memory:
         if len(self.store) == 0:
             return []
         self._sync_episodes()
-        ranked = self._rank(query, mode, as_of, where, None, pool, False)
+        ranked = self._rank(query, mode, as_of, where, None, pool, False,
+                            when=when, now=now, rerank=rerank, rerank_pool=rerank_pool)
         if not ranked:
             return []
         fids = np.array([f for f, _ in ranked])
@@ -451,14 +491,14 @@ class Memory:
         ep_score = {e: max(h.values()) + 1e-3 * sum(h.values()) for e, h in ep_hits.items()}
         top = sorted(ep_score, key=lambda e: -ep_score[e])[:k]
         per = max(budget_chars // max(len(top), 1), 1)
-        vis = self._mask(as_of, None)
+        vis = self._mask(as_of, None, self._window(when, query, now))  # spans stay inside `when`
         q = self.embedder.embed([query])[0]
         bounds = self.episodes.bounds()
         spans: list[Span] = []
         for e in top:
             s, end = bounds[e]  # [s, end)
             lo, hi = self._grow_span(s, end, ep_hits[e], vis, q, per)
-            frames = tuple(self.store.range(lo, hi + 1, True, as_of))
+            frames = tuple(f for f in self.store.range(lo, hi + 1, True, as_of) if vis[f.id])
             if not frames:
                 continue
             spans.append(Span(lo, hi, frames[0].t, frames[-1].t, frames, ep_score[e], e, end - s,
@@ -532,6 +572,28 @@ class Memory:
     def window(self, t0: float, t1: float) -> list[Frame]:
         lo, hi = self.store.time_range(t0, t1)
         return self.store.range(lo, hi, True)
+
+    def ask(self, question: str, synthesizer, *, k: int = 8, context: int = 1,
+            budget_chars: int = 6000, spans: bool = False, **search_kw):
+        """Retrieve memory, have `synthesizer(question, context_text)` answer it, and
+        return an Answer whose `citations` are the frames the answer cited.
+        spans=True feeds contiguous scenes (recall_span) instead of top-k hits."""
+        from .ask import Answer, build_context, extract_citations
+
+        if spans:
+            frames = [f for sp in self.recall_span(question, 2, budget_chars, **search_kw) for f in sp.frames]
+        else:
+            seen: dict[int, Frame] = {}
+            used = 0
+            for h in self.search(question, k, context, **search_kw):
+                for f in h.context():
+                    if f.id not in seen and used + len(f.text) <= budget_chars:
+                        seen[f.id] = f
+                        used += len(f.text)
+            frames = sorted(seen.values(), key=lambda f: f.id)
+        ctx = build_context(frames)
+        text = synthesizer(question, ctx)
+        return Answer(question, text, extract_citations(text, frames), frames, ctx)
 
     @_locked
     def stats(self) -> dict[str, Any]:
