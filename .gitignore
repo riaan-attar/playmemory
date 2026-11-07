@@ -5,3 +5,7 @@ __pycache__/
 *.npy
 .pytest_cache/
 *.egg-info/
+dist/
+build/
+*.egg-info/
+graphify-out/

@@ -1,26 +1,49 @@
 [project]
 name = "playmemory"
-version = "0.1.0"
-description = "Timeline ('video-like') memory layer for AI systems"
+dynamic = ["version"]
+description = "Lightweight single-file timeline memory for AI agents: hybrid search, scenes, time travel."
+readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["numpy"]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Riaan Attar" }]
+keywords = ["llm", "memory", "rag", "agents", "mcp", "embeddings", "retrieval"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = ["numpy>=1.22"]
 
 [project.optional-dependencies]
+onnx = ["onnxruntime", "tokenizers"]   # local BGE-small embedder, no torch
 st = ["sentence-transformers"]
-onnx = ["onnxruntime", "tokenizers"]
-ann = ["faiss-cpu"]
+ann = ["faiss-cpu"]                    # HNSW for very large memories
 bench = ["faiss-cpu"]
-dev = ["pytest"]
+all = ["onnxruntime", "tokenizers", "faiss-cpu"]
+dev = ["pytest", "build", "twine"]
 
 [project.scripts]
 playmemory = "playmemory.cli:main"
 
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.dynamic]
+version = { attr = "playmemory.__version__" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+playmemory = ["py.typed"]
 
 [tool.pytest.ini_options]
 pythonpath = ["src", "."]
