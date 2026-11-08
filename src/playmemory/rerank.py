@@ -25,7 +25,9 @@ class OnnxCrossEncoder:
 
         model_path = model_path or OnnxEmbedder._fetch(repo, "onnx/model.onnx")
         tokenizer_path = tokenizer_path or OnnxEmbedder._fetch(repo, "tokenizer.json")
-        self._sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        from .embed import _session_options
+
+        self._sess = ort.InferenceSession(model_path, _session_options(ort), providers=["CPUExecutionProvider"])
         self._inputs = {i.name for i in self._sess.get_inputs()}
         self._tok = Tokenizer.from_file(tokenizer_path)
         self._tok.enable_truncation(max_len)

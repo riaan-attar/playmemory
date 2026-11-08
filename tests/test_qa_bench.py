@@ -93,3 +93,31 @@ def test_batches_are_disjoint_complete_and_crash_tolerant(tmp_path):
     asked.clear()
     score, calls = run(data(), HashEmbedder(), sample=0, start=0, **kw)
     assert calls == 0 and asked == [] and len(score[("chunks", "all")]) == 2
+
+
+def test_memory_guard_passes_when_free_and_raises_when_not(monkeypatch):
+    import bench.qa as qa
+
+    guard = qa.memory_guard(min_free_mb=1, max_swap_pct=100.0, wait_s=0)
+    guard()  # plenty of memory: returns
+    tight = qa.memory_guard(min_free_mb=10**9, wait_s=0)  # impossible requirement
+    with pytest.raises(qa.MemoryPressure, match="available"):
+        tight()
+
+
+def test_run_stops_cleanly_under_pressure_and_keeps_saved_rows(tmp_path):
+    import bench.qa as qa
+    from playmemory import HashEmbedder
+
+    cache = tmp_path / "c.jsonl"
+    calls = {"n": 0}
+
+    def guard():
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise qa.MemoryPressure("test")
+
+    with pytest.raises(qa.MemoryPressure):
+        run(data(), HashEmbedder(), answer=lambda q, c: "Rex", judge=None, budget=400, sample=0, rr=None,
+            cache_path=str(cache), systems=("chunks",), guard=guard)
+    assert len(cache.read_text().splitlines()) == 1  # the first answer was durably saved before the stop

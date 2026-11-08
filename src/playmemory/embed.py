@@ -104,6 +104,17 @@ class HTTPEmbedder:
         return arr / norms
 
 
+def _session_options(ort):
+    """onnxruntime session options; PLAYMEMORY_ONNX_THREADS caps CPU threads (default: all cores)."""
+    import os
+
+    so = ort.SessionOptions()
+    n = os.environ.get("PLAYMEMORY_ONNX_THREADS")
+    if n:
+        so.intra_op_num_threads = int(n)
+    return so
+
+
 class OnnxEmbedder:
     """Local ONNX sentence embedder without torch (extra: `onnx`).
 
@@ -121,7 +132,7 @@ class OnnxEmbedder:
 
         model_path = model_path or self._fetch(repo, "onnx/model.onnx")
         tokenizer_path = tokenizer_path or self._fetch(repo, "tokenizer.json")
-        self._sess = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        self._sess = ort.InferenceSession(model_path, _session_options(ort), providers=["CPUExecutionProvider"])
         self._inputs = {i.name for i in self._sess.get_inputs()}
         self._tok = Tokenizer.from_file(tokenizer_path)
         self._tok.enable_truncation(max_len)
