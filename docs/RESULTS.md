@@ -107,14 +107,18 @@ commands in `bench/vs_memvid.py`. Search speed is comparable (both well under 2 
 smaller on disk and about 400x faster to build here, with the caveat that Memvid's build also creates a
 Tantivy index and HNSW graph from scratch.
 
-## 4. Scale / speed (synthetic clustered text, hash embedder; `python -m bench.run`)
-| n | exact (numpy) | HNSW (faiss, persisted) | full hybrid API |
-|---|---|---|---|
-| 100k | recall 1.00, p50 ~7-10 ms | recall 0.996, p50 ~0.6 ms | ~2.2 ms |
+## 4. Scale / speed (`python -m bench.scale`, synthetic clustered vectors)
+| frames x dim | add | open (checkpointed) | exact scan | BM25 | HNSW | full hybrid API | file | peak RSS |
+|---|---|---|---|---|---|---|---|---|
+| 200k x 128 | 28k/s | 1.2 s | 9.9 ms | 0.5 ms | 0.5 ms, recall@10 0.40 (ef=64) | 1.4 ms | 139 MB | 1.3 GB |
+| 500k x 64 | 29k/s | 3.1 s | 26.8 ms | 1.2 ms | 0.4-1.0 ms, recall@10 0.35 / 0.43 / 0.53 / 0.74 at ef 64 / 128 / 256 / 512 | 2.7 ms | 220 MB | 1.7 GB |
 
-Open time at 100k frames: 2.25 s without a checkpoint, 0.5 s with one.
+HNSW recall here is a hard case (Gaussian noise around 1,000 centres, so many near-ties); on the earlier
+100k clustered-text benchmark it was 0.996. `Memory(ann_ef_search=...)` trades latency for recall.
+The exact scan is linear (about 27 ms at 500k), which is why HNSW takes over above `ann_threshold`.
+1M frames was not run on this 15 GB machine.
 
 ## Known limits
-Single embedder and dataset; no answer-quality metric; scene boundaries use a similarity
-heuristic with `session` metadata as forced boundaries (LoCoMo provides sessions);
-No answer-quality (LLM-judged) benchmark has been run yet; it needs an LLM API key.
+Single embedder and dataset for quality; no answer-quality (LLM-judged) benchmark; scene boundaries use a
+similarity heuristic with `session` metadata as forced boundaries (LoCoMo provides sessions); the Memvid
+comparison covers its default hybrid mode via the Python SDK only.

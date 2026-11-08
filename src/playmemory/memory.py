@@ -93,6 +93,7 @@ class Memory:
         embedder: Embedder | str | None = None,
         *,
         ann_threshold: int | None = 200_000,
+        ann_ef_search: int = 128,
         episode_config: EpisodeConfig | None = None,
         read_only: bool = False,
         sync: str = "batch",
@@ -134,6 +135,7 @@ class Memory:
         self._flags = FLAG_VEC_F16 if vec_dtype == "float16" else 0
         self.auto_refresh = auto_refresh and read_only
         self.ann_threshold = ann_threshold
+        self.ann_ef_search = ann_ef_search
         self.episode_config = episode_config or EpisodeConfig()
         self.max_text_bytes = max_text_bytes
         self.max_meta_bytes = max_meta_bytes
@@ -168,7 +170,7 @@ class Memory:
         saved = self.store.read_ann() if self.ann_threshold is not None else None
         if saved and saved[0] <= len(self.store):
             try:
-                self.ann = AnnIndex.from_bytes(saved[1])
+                self.ann = AnnIndex.from_bytes(saved[1], self.ann_ef_search)
                 if len(self.ann) < len(self.store):  # frames added since it was saved
                     self.ann.add(self.index.vectors[len(self.ann):])
             except ImportError:
@@ -463,7 +465,7 @@ class Memory:
     def build_ann(self) -> None:
         """Build the HNSW graph now (needs the 'ann' extra). It is then kept
         up to date on every add and saved with each checkpoint."""
-        self.ann = AnnIndex.build(self.index.vectors)
+        self.ann = AnnIndex.build(self.index.vectors, ef_search=self.ann_ef_search)
 
     @_writes
     def compact(self, keep_history: bool = False) -> dict[str, int]:

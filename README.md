@@ -364,9 +364,13 @@ Tools: `remember`, `recall` (with `when`), `recall_story`, `read_span`, `forget`
 | up to ~200k | Exact vectorised numpy scan plus BM25. |
 | above `ann_threshold` | Persisted HNSW via faiss (`playmemory[ann]`), rebuilt with `build_ann()` and saved by `checkpoint()`. |
 
-Measured with the hash embedder on synthetic clustered text at 100k frames: exact search has
-recall 1.00 at p50 about 7 to 10 ms; HNSW has recall 0.996 at about 0.6 ms; the full hybrid API
-runs at about 2.2 ms. Opening takes 2.25 s without a checkpoint and 0.5 s with one.
+Measured (`python -m bench.scale`, synthetic clustered vectors, 16-core CPU): at 500k frames x 64-d,
+adds run at about 29k/s, opening a checkpointed file takes 3.1 s, an exact vector scan takes 27 ms,
+BM25 1.2 ms and the full hybrid API 2.7 ms with HNSW. At 200k x 128-d: exact 9.9 ms, hybrid 1.4 ms.
+HNSW recall depends on the data and on `ann_ef_search` (default 128): on this deliberately noisy
+synthetic data recall@10 climbs from 0.35 (ef=64) to 0.74 (ef=512) at about 1 ms, while on the
+clustered text benchmark at 100k it was 0.996. Peak RSS was 1.7 GB at 500k. 1M frames was not run
+(it would not fit comfortably in the 15 GB test machine's free memory).
 
 The older centroid segment index was removed: it was slower than HNSW at equal recall and
 collapsed when the data was not temporally clustered (`docs/DESIGN.md`).
@@ -403,8 +407,8 @@ Full tables, per-category numbers and caveats are in [docs/RESULTS.md](docs/RESU
   the Python SDK", not a verdict on Memvid; details and caveats in [docs/RESULTS.md](docs/RESULTS.md).
 - The metric is retrieval only, on one dataset and one embedder.
 - Experimental, tested only with fakes in CI: audio transcription, CLIP images, spaCy NER.
-- Not done: Node.js / npm / Rust packages, an HTTP server, and the "sketch" candidate prefilter (profiling
-  did not justify it below ~1M frames).
+- Not done: Node.js / npm / Rust packages, an HTTP server, and a "sketch" candidate prefilter (an exact
+  scan costs 27 ms at 500k frames and HNSW answers in about 1 ms, so it was not worth the complexity).
 - `HashEmbedder` (`"debug"`) is non-semantic; production code must pass a real embedder.
 
 ## Project layout
