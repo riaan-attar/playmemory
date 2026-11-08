@@ -37,3 +37,52 @@ chunks+rr   single-hop       0.415   0.333    53
 span2+rr    single-hop       0.415   0.303    53
 span3+rr    single-hop       0.491   0.334    53
 
+2026-11-08 23:10:02  batch 0: results committed to git
+2026-11-08 23:10:06  batch 0: pushed to origin
+2026-11-08 23:10:06  batch 100: attempt 1 | rows=537 | used 4774 MB, avail 10905 MB, swap 2512 MB
+2026-11-08 23:30:37  batch 100: DONE (rows=860)
+span3+rr    multi-hop        0.000   0.206    19
+
+chunks      temporal         0.136   0.193    22
+chunks+rr   temporal         0.136   0.206    22
+span2+rr    temporal         0.182   0.286    22
+span3+rr    temporal         0.182   0.225    22
+
+chunks      open-domain      0.000   0.045     4
+chunks+rr   open-domain      0.000   0.058     4
+span2+rr    open-domain      0.000   0.048     4
+span3+rr    open-domain      0.000   0.048     4
+
+chunks      single-hop       0.491   0.324    55
+chunks+rr   single-hop       0.527   0.366    55
+span2+rr    single-hop       0.564   0.363    55
+span3+rr    single-hop       0.509   0.334    55
+
+== cumulative: questions 0-199 ==
+
+system      group          correct      F1     n
+chunks      all              0.255   0.255   200
+chunks+rr   all              0.285   0.270   200
+span2+rr    all              0.300   0.271   200
+span3+rr    all              0.310   0.267   200
+
+chunks      multi-hop        0.050   0.149    40
+chunks+rr   multi-hop        0.050   0.188    40
+span2+rr    multi-hop        0.075   0.220    40
+span3+rr    multi-hop        0.075   0.217    40
+
+chunks      temporal         0.071   0.197    42
+chunks+rr   temporal         0.071   0.180    42
+span2+rr    temporal         0.095   0.209    42
+span3+rr    temporal         0.095   0.184    42
+
+chunks      open-domain      0.000   0.126    10
+chunks+rr   open-domain      0.100   0.112    10
+span2+rr    open-domain      0.000   0.052    10
+span3+rr    open-domain      0.100   0.084    10
+
+chunks      single-hop       0.426   0.329   108
+chunks+rr   single-hop       0.472   0.350   108
+span2+rr    single-hop       0.491   0.333   108
+span3+rr    single-hop       0.500   0.334   108
+
