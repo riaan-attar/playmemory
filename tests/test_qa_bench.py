@@ -71,3 +71,25 @@ def test_pipeline_without_llm_judge_uses_f1(tmp_path):
                        judge=None, budget=400, sample=0, rr=None, cache_path=None, systems=("chunks",))
     assert calls == 2 and score[("chunks", "all")] == [1.0, 0.0]  # contains-gold decides
     assert score[("chunks", "all", "f1")][0] >= 0.5 and score[("chunks", "all", "f1")][1] == 0.0
+
+
+def test_batches_are_disjoint_complete_and_crash_tolerant(tmp_path):
+    from playmemory import HashEmbedder
+    cache = tmp_path / "c.jsonl"
+    asked = []
+
+    def answer(q, ctx):
+        asked.append(q)
+        return "Rex"
+
+    kw = dict(answer=answer, judge=None, budget=400, rr=None, cache_path=str(cache), systems=("chunks",))
+    run(data(), HashEmbedder(), sample=1, start=0, **kw)
+    run(data(), HashEmbedder(), sample=1, start=1, **kw)
+    assert len(asked) == 2 and len(set(asked)) == 2  # two batches of one question: no overlap, nothing missed
+    lines = cache.read_text().splitlines()
+    assert len(lines) == 2
+    # simulate a crash mid-write: a truncated last line must be ignored, not break the resume
+    cache.write_text("\n".join(lines) + "\n" + lines[0][:25])
+    asked.clear()
+    score, calls = run(data(), HashEmbedder(), sample=0, start=0, **kw)
+    assert calls == 0 and asked == [] and len(score[("chunks", "all")]) == 2

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import time
@@ -84,11 +85,14 @@ def frames_for(mem, system: str, q: str, budget: int, rr) -> list:
     return [f for sp in spans for f in sp.frames]
 
 
-def run(data, embedder, *, answer, judge, budget, sample, rr, cache_path, seed=0, systems=SYSTEMS):
+def run(data, embedder, *, answer, judge, budget, sample, rr, cache_path, seed=0, systems=SYSTEMS, start=0):
     cache = {}
     if cache_path and Path(cache_path).exists():
         for line in open(cache_path):
-            r = json.loads(line)
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:  # a crash can leave a half-written last line: skip it
+                continue
             cache[(r["conv"], r["q"], r["system"])] = r
     out = open(cache_path, "a") if cache_path else None
     items = []
@@ -97,7 +101,7 @@ def run(data, embedder, *, answer, judge, budget, sample, rr, cache_path, seed=0
             if qa["category"] in CATS and qa.get("answer") is not None:
                 items.append((ci, qa))
     random.Random(seed).shuffle(items)
-    items = items[:sample] if sample else items
+    items = items[start : start + sample] if sample else items[start:]
     by_conv = defaultdict(list)
     for ci, qa in items:
         by_conv[ci].append(qa)
@@ -105,16 +109,19 @@ def run(data, embedder, *, answer, judge, budget, sample, rr, cache_path, seed=0
     calls = 0
     for ci, qas in sorted(by_conv.items()):
         smp = data[ci]
-        turns = load_turns(smp["conversation"])
-        mem = Memory(None, embedder, episode_config=EpisodeConfig(boundary_key="session"))
-        mem.add_many([t for _, t in turns], metas=[{"session": int(d.split(":")[0][1:]), "dia": d} for d, _ in turns],
-                     times=[float(i) for i in range(len(turns))])
+        mem = None  # built lazily: a fully cached conversation costs nothing
         for qa in qas:
             for system in systems:
                 key = (smp["sample_id"], qa["question"], system)
                 if key in cache:
                     r = cache[key]
                 else:
+                    if mem is None:
+                        turns = load_turns(smp["conversation"])
+                        mem = Memory(None, embedder, episode_config=EpisodeConfig(boundary_key="session"))
+                        mem.add_many([t for _, t in turns],
+                                     metas=[{"session": int(d.split(":")[0][1:]), "dia": d} for d, _ in turns],
+                                     times=[float(i) for i in range(len(turns))])
                     ctx = build_context(frames_for(mem, system, qa["question"], budget, rr))
                     raw = answer(qa["question"], ctx) or ""
                     pred = raw.strip().splitlines()[0] if raw.strip() else ""  # small models add explanations; score the answer line
@@ -127,9 +134,10 @@ def run(data, embedder, *, answer, judge, budget, sample, rr, cache_path, seed=0
                         r["correct"] = verdict.strip().upper().startswith("CORRECT")
                         calls += 1
                     cache[key] = r
-                    if out:
+                    if out:  # durable before moving on: survives a crash or power loss
                         out.write(json.dumps(r) + "\n")
                         out.flush()
+                        os.fsync(out.fileno())
                 for g in ("all", CATS[r["cat"]]):
                     score[(system, g)].append(float(r["correct"]))
                     score[(system, g, "f1")].append(float(r.get("f1", 0.0)))
@@ -190,7 +198,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True)
     ap.add_argument("--embedder", default="onnx")
-    ap.add_argument("--sample", type=int, default=300, help="random questions to evaluate (0 = all)")
+    ap.add_argument("--sample", "--count", dest="sample", type=int, default=300,
+                    help="questions in this batch (0 = all remaining)")
+    ap.add_argument("--start", type=int, default=0,
+                    help="first question of the batch in the fixed shuffled order (batch k starts at k*count)")
     ap.add_argument("--budget", type=int, default=2000)
     ap.add_argument("--llm", default="claude:claude-haiku-5-5",
                     help="answering model: claude:MODEL | ollama:MODEL[@URL] | openai:MODEL[@URL]")
@@ -211,10 +222,21 @@ def main():
     systems = SYSTEMS if rr else ("chunks", "span2", "span3")
     t0 = time.perf_counter()
     score, calls = run(data, emb, answer=answer, judge=(None if judge_llm is None else (lambda q, c: judge_llm(q, c))), budget=a.budget,
-                       sample=a.sample, rr=rr, cache_path=a.cache, systems=systems)
+                       sample=a.sample, rr=rr, cache_path=a.cache, systems=systems, start=a.start)
     print(f"\nLoCoMo answer accuracy, budget={a.budget} chars, answering={a.llm}, scoring={a.judge}, "
+          f"questions {a.start}-{a.start + a.sample - 1 if a.sample else 'end'} (this batch), "
           f"{calls} new calls, {time.perf_counter()-t0:.0f}s\n")
     report(score, systems)
+    if a.start:  # cumulative view over everything answered so far (served from the cache, no new calls)
+        def _missing(*_):
+            raise RuntimeError("cumulative view needs earlier batches to be complete")
+        try:
+            cum, _ = run(data, emb, answer=_missing, judge=None, budget=a.budget,
+                         sample=a.start + a.sample, rr=rr, cache_path=a.cache, systems=systems, start=0)
+            print(f"== cumulative: questions 0-{a.start + a.sample - 1} ==\n")
+            report(cum, systems)
+        except RuntimeError as e:
+            print(f"(no cumulative table: {e})")
 
 
 if __name__ == "__main__":
