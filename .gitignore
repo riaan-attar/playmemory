@@ -11,3 +11,7 @@ build/
 graphify-out/
 .env
 qa_cache.jsonl
+
+.qa_done_*
+.qa_supervisor.lock
+*.jsonl.lock
