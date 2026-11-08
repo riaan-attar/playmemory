@@ -147,3 +147,36 @@ def test_phases_split_work_and_match_single_pass(tmp_path):
     s1, c1 = run(data(), HashEmbedder(), answer=lambda q, c: "Rex", rr=None, phase="all", **one)
     assert c1 == 4
     assert (tmp_path / "e.contexts.jsonl").read_text() == ctxf.read_text()
+
+
+def test_ollama_client_recycles_model_every_n_calls():
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    from bench.qa import OllamaChat
+
+    seen = []
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            seen.append((self.path, body.get("keep_alive")))
+            out = json.dumps({"message": {"content": "ok"}, "response": ""}).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        llm = OllamaChat("m", "sys", url=f"http://127.0.0.1:{srv.server_port}", recycle_every=3)
+        for _ in range(7):
+            assert llm("q", "ctx") == "ok"
+    finally:
+        srv.shutdown()
+    kinds = ["unload" if kA == 0 else "chat" for (path, kA) in seen]
+    assert kinds == ["chat"] * 3 + ["unload"] + ["chat"] * 3 + ["unload"] + ["chat"]  # unloads before calls 4 and 7... 

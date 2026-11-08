@@ -215,14 +215,32 @@ class OllamaChat:
     """Ollama's native /api/chat (lets us set options such as num_gpu=0 to stay on CPU) with retries:
     a crashed runner (e.g. GPU out of memory) is restarted by the server, so a retry usually works."""
 
-    def __init__(self, model, system, max_tokens=60, url="http://localhost:11434", options=None, retries=3):
+    def __init__(self, model, system, max_tokens=60, url="http://localhost:11434", options=None, retries=3,
+                 recycle_every=25):
         self.model, self.system, self.url, self.retries = model, system, url.rstrip("/"), retries
+        # Ollama keeps the processed state of every distinct prompt (~70 MB each). After ~60 prompts the
+        # runner holds 4-5 GB and this machine (iGPU shares system RAM) crawls ~20x slower, so unload the
+        # model every N calls; the next call reloads it in a few seconds with an empty cache.
+        self.recycle_every, self._calls = recycle_every, 0
         self.options = {"num_predict": max_tokens, "temperature": 0, "num_ctx": 4096, **(options or {})}
+
+    def unload(self):
+        import urllib.request
+
+        try:
+            req = urllib.request.Request(self.url + "/api/generate", json.dumps({"model": self.model, "keep_alive": 0}).encode(),
+                                         {"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=60).read()
+        except Exception:  # best effort: a failed unload only means the next call is no faster
+            pass
 
     def __call__(self, question, context):
         import urllib.error
         import urllib.request
 
+        if self.recycle_every and self._calls and self._calls % self.recycle_every == 0:
+            self.unload()
+        self._calls += 1
         body = json.dumps({"model": self.model, "stream": False, "options": self.options, "messages": [
             {"role": "system", "content": self.system},
             {"role": "user", "content": f"Memory passages:\n{context}\n\nQuestion: {question}"}]}).encode()
