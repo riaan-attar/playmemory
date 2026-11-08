@@ -22,12 +22,18 @@ mem() { free -m | awk 'NR==2{printf "used %d MB, avail %d MB",$3,$7} NR==3{print
 rows() { [ -f "$CACHE" ] && wc -l < "$CACHE" || echo 0; }
 
 export PLAYMEMORY_ONNX_THREADS=$THREADS OMP_NUM_THREADS=$THREADS
+# Two phases per batch: CPU-heavy retrieval first (no LLM running), then LLM answers with an idle Python.
+# Run together, the CPU work between calls made Ollama's integrated-GPU runner ~20x slower on this machine.
 default_runner() {
-  nice -n 10 .venv/bin/python -m bench.qa --data "$DATA" --start "$1" --count "$BATCH" --llm "$LLM" \
+  nice -n 10 .venv/bin/python -m bench.qa --data "$DATA" --start "$1" --count "$BATCH" --llm "$LLM" --phase "${2:-all}" \
     --ollama-opt num_batch=64 --ollama-opt num_ctx=2048 --ollama-opt num_thread="${OLLAMA_THREADS:-4}" \
     --judge f1 --budget 2000 --cache "$CACHE" --min-free-mb "$MIN_FREE_MB"
 }
-run_batch() { if [ -n "${RUNNER:-}" ]; then $RUNNER "$1"; else default_runner "$1"; fi; }
+run_batch() { # $1 = start; runs the contexts phase, then the answer phase; fails if either fails
+  if [ -n "${RUNNER:-}" ]; then $RUNNER "$1"; return $?; fi
+  default_runner "$1" contexts || return $?
+  default_runner "$1" answer
+}
 
 log "supervisor start: total=$TOTAL batch=$BATCH threads=$THREADS min_free=${MIN_FREE_MB}MB | rows=$(rows) | $(mem)"
 failed=0
@@ -51,7 +57,7 @@ for start in $(seq 0 "$BATCH" $((TOTAL - BATCH))); do
     wait_s=$((BACKOFF * attempt)); log "batch $start: waiting ${wait_s}s before retry"; sleep "$wait_s"
   done
   ollama stop "$MODEL_NAME" >/dev/null 2>&1   # free the model's memory between batches
-  git add "$CACHE" "$RES/qa_batch_${start}.txt" "$LOG" 2>/dev/null
+  git add "$CACHE" "${CACHE%.jsonl}.contexts.jsonl" "$RES/qa_batch_${start}.txt" "$LOG" 2>/dev/null
   git commit -q -m "QA benchmark results after batch $start ($MODEL_NAME, F1 scoring)
 
 Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>" 2>/dev/null && log "batch $start: results committed to git"

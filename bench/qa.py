@@ -114,7 +114,9 @@ def frames_for(mem, system: str, q: str, budget: int, rr) -> list:
     return [f for sp in spans for f in sp.frames]
 
 
-def run(data, embedder, *, answer, judge, budget, sample, rr, cache_path, seed=0, systems=SYSTEMS, start=0, guard=None):
+def run(data, embedder, *, answer, judge, budget, sample, rr, cache_path, seed=0, systems=SYSTEMS, start=0, guard=None, phase="all", ctx_path=None):
+    """phase: all (retrieve + answer) | contexts (CPU only: retrieve and store contexts) |
+    answer (LLM only: answer from stored contexts; no embedding or reranker models are touched)."""
     cache = {}
     if cache_path and Path(cache_path).exists():
         for line in open(cache_path):
@@ -124,6 +126,16 @@ def run(data, embedder, *, answer, judge, budget, sample, rr, cache_path, seed=0
                 continue
             cache[(r["conv"], r["q"], r["system"])] = r
     out = open(cache_path, "a") if cache_path else None
+    ctxs = {}  # (conv, question, system) -> context text; stored so phases can run separately and be inspected
+    if ctx_path and Path(ctx_path).exists():
+        for line in open(ctx_path):
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ctxs[(r["conv"], r["q"], r["system"])] = r["ctx"]
+    ctx_out = open(ctx_path, "a") if ctx_path else None
+    missing = 0
     items = []
     for ci, smp in enumerate(data):
         for qa in smp["qa"]:
@@ -145,13 +157,25 @@ def run(data, embedder, *, answer, judge, budget, sample, rr, cache_path, seed=0
                 if key in cache:
                     r = cache[key]
                 else:
-                    if mem is None:
-                        turns = load_turns(smp["conversation"])
-                        mem = Memory(None, embedder, episode_config=EpisodeConfig(boundary_key="session"))
-                        mem.add_many([t for _, t in turns],
-                                     metas=[{"session": int(d.split(":")[0][1:]), "dia": d} for d, _ in turns],
-                                     times=[float(i) for i in range(len(turns))])
-                    ctx = build_context(frames_for(mem, system, qa["question"], budget, rr))
+                    ctx = ctxs.get(key)
+                    if ctx is None:
+                        if phase == "answer":
+                            missing += 1
+                            continue  # run the contexts phase first
+                        if mem is None:
+                            turns = load_turns(smp["conversation"])
+                            mem = Memory(None, embedder, episode_config=EpisodeConfig(boundary_key="session"))
+                            mem.add_many([t for _, t in turns],
+                                         metas=[{"session": int(d.split(":")[0][1:]), "dia": d} for d, _ in turns],
+                                         times=[float(i) for i in range(len(turns))])
+                        ctx = build_context(frames_for(mem, system, qa["question"], budget, rr))
+                        ctxs[key] = ctx
+                        if ctx_out:
+                            ctx_out.write(json.dumps({"conv": key[0], "q": key[1], "system": system, "ctx": ctx}) + "\n")
+                            ctx_out.flush()
+                            os.fsync(ctx_out.fileno())
+                    if phase == "contexts":
+                        continue
                     if guard:
                         guard()
                     raw = answer(qa["question"], ctx) or ""
@@ -172,6 +196,8 @@ def run(data, embedder, *, answer, judge, budget, sample, rr, cache_path, seed=0
                 for g in ("all", CATS[r["cat"]]):
                     score[(system, g)].append(float(r["correct"]))
                     score[(system, g, "f1")].append(float(r.get("f1", 0.0)))
+    if phase == "answer" and missing:
+        print(f"(skipped {missing} answers whose context has not been built yet: run --phase contexts first)")
     return score, calls
 
 
@@ -242,6 +268,9 @@ def main():
     ap.add_argument("--no-rerank", action="store_true")
     ap.add_argument("--ollama-opt", action="append", default=[], metavar="K=V",
                     help="Ollama option, e.g. num_gpu=0 to run on CPU only (repeatable)")
+    ap.add_argument("--phase", choices=["all", "contexts", "answer"], default="all",
+                    help="contexts: CPU only, store retrieved contexts | answer: LLM only, from stored contexts")
+    ap.add_argument("--contexts", default=None, help="contexts file (default: <cache>.contexts.jsonl)")
     ap.add_argument("--min-free-mb", type=int, default=2500,
                     help="pause, then stop cleanly, if available RAM stays below this")
     a = ap.parse_args()
@@ -255,21 +284,26 @@ def main():
         raise SystemExit(f"another bench.qa run is already using {a.cache}; refusing to start a second one")
 
     data = json.load(open(a.data))
-    emb = CachedEmbedder(from_spec(a.embedder))
-    rr = None if a.no_rerank else CachedReranker(OnnxCrossEncoder())
+    ctx_path = a.contexts or a.cache.replace(".jsonl", "") + ".contexts.jsonl"
+    need_models = a.phase != "answer"  # the answer phase must not load or run any CPU-heavy model
+    emb = CachedEmbedder(from_spec(a.embedder)) if need_models else None
+    rr = None if (a.no_rerank or not need_models) else CachedReranker(OnnxCrossEncoder())
     opts = {k: int(v) if v.lstrip("-").isdigit() else v for k, v in (o.split("=", 1) for o in a.ollama_opt)}
-    answer = make_llm(a.llm, SHORT_SYSTEM, 60, opts)
+    answer = make_llm(a.llm, SHORT_SYSTEM, 60, opts) if a.phase != "contexts" else None
     judge_llm = None if a.judge == "f1" else make_llm(a.judge, JUDGE_SYSTEM, 5)
     judge = None if judge_llm is None else (lambda q, c: judge_llm(q, c))
-    systems = SYSTEMS if rr else ("chunks", "span2", "span3")
+    systems = ("chunks", "span2", "span3") if a.no_rerank else SYSTEMS
     t0 = time.perf_counter()
     try:
         score, calls = run(data, emb, answer=answer, judge=judge, budget=a.budget, sample=a.sample, rr=rr,
                            cache_path=a.cache, systems=systems, start=a.start,
-                           guard=memory_guard(a.min_free_mb))
+                           guard=memory_guard(a.min_free_mb), phase=a.phase, ctx_path=ctx_path)
     except MemoryPressure as e:
         print(f"\nSTOPPED: {e}. Everything answered so far is saved in {a.cache}; rerun the same command to resume.")
         raise SystemExit(3)
+    if a.phase == "contexts":
+        print(f"\ncontexts phase done: {len(open(ctx_path).readlines()) if Path(ctx_path).exists() else 0} stored in {ctx_path}")
+        return
     print(f"\nLoCoMo answer accuracy, budget={a.budget} chars, answering={a.llm}, scoring={a.judge}, "
           f"questions {a.start}-{a.start + a.sample - 1 if a.sample else 'end'} (this batch), "
           f"{calls} new calls, {time.perf_counter()-t0:.0f}s\n")
@@ -279,7 +313,8 @@ def main():
             raise RuntimeError("cumulative view needs earlier batches to be complete")
         try:
             cum, _ = run(data, emb, answer=_missing, judge=None, budget=a.budget,
-                         sample=a.start + a.sample, rr=rr, cache_path=a.cache, systems=systems, start=0)
+                         sample=a.start + a.sample, rr=rr, cache_path=a.cache, systems=systems, start=0,
+                         phase="answer", ctx_path=ctx_path)
             print(f"== cumulative: questions 0-{a.start + a.sample - 1} ==\n")
             report(cum, systems)
         except RuntimeError as e:

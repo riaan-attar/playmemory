@@ -1,0 +1,6 @@
+2026-11-08 22:07:16  supervisor start: total=300 batch=100 threads=8 min_free=3000MB | rows=289 | used 5256 MB, avail 10424 MB, swap 1710 MB
+2026-11-08 22:07:16  batch 0: attempt 1 | rows=289 | used 5257 MB, avail 10423 MB, swap 1710 MB
+2026-11-08 22:35:03  supervisor start: total=300 batch=100 threads=8 min_free=3000MB | rows=356 | used 4706 MB, avail 10974 MB, swap 2210 MB
+2026-11-08 22:35:03  batch 0: attempt 1 | rows=356 | used 4706 MB, avail 10974 MB, swap 2210 MB
+2026-11-08 22:42:31  supervisor start: total=300 batch=100 threads=4 min_free=3000MB | rows=363 | used 7364 MB, avail 8316 MB, swap 2312 MB
+2026-11-08 22:42:31  batch 0: attempt 1 | rows=363 | used 7364 MB, avail 8316 MB, swap 2312 MB

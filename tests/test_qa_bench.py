@@ -121,3 +121,29 @@ def test_run_stops_cleanly_under_pressure_and_keeps_saved_rows(tmp_path):
         run(data(), HashEmbedder(), answer=lambda q, c: "Rex", judge=None, budget=400, sample=0, rr=None,
             cache_path=str(cache), systems=("chunks",), guard=guard)
     assert len(cache.read_text().splitlines()) == 1  # the first answer was durably saved before the stop
+
+
+def test_phases_split_work_and_match_single_pass(tmp_path):
+    """contexts phase builds+stores contexts with no LLM; answer phase answers from them with no models."""
+    from playmemory import HashEmbedder
+
+    cache, ctxf = tmp_path / "c.jsonl", tmp_path / "c.contexts.jsonl"
+    asked = []
+    kw = dict(judge=None, budget=400, sample=0, systems=("chunks", "span2"), cache_path=str(cache), ctx_path=str(ctxf))
+    # phase 1: no answerer is ever called, nothing is answered
+    score, calls = run(data(), HashEmbedder(), answer=lambda *a: 1 / 0, rr=None, phase="contexts", **kw)
+    assert calls == 0 and (not cache.exists() or cache.read_text() == "")  # nothing answered yet
+    stored = [json.loads(line) for line in ctxf.read_text().splitlines()]
+    assert len(stored) == 4 and all("[" in r["ctx"] for r in stored)  # 2 questions x 2 systems, numbered passages
+    # phase 2: embedder=None proves no model/memory is needed to answer
+    score, calls = run(data(), None, answer=lambda q, c: asked.append(c) or "Rex", rr=None, phase="answer", **kw)
+    assert calls == 4 and len(asked) == 4 and asked[0] == stored[0]["ctx"]
+    # answering before contexts exist skips cleanly instead of crashing
+    other = dict(kw, cache_path=str(tmp_path / "d.jsonl"), ctx_path=str(tmp_path / "d.contexts.jsonl"))
+    score, calls = run(data(), None, answer=lambda *a: 1 / 0, rr=None, phase="answer", **other)
+    assert calls == 0 and not score
+    # a single pass produces identical answers/contexts
+    one = dict(kw, cache_path=str(tmp_path / "e.jsonl"), ctx_path=str(tmp_path / "e.contexts.jsonl"))
+    s1, c1 = run(data(), HashEmbedder(), answer=lambda q, c: "Rex", rr=None, phase="all", **one)
+    assert c1 == 4
+    assert (tmp_path / "e.contexts.jsonl").read_text() == ctxf.read_text()
