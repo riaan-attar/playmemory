@@ -112,6 +112,8 @@ def _session_options(ort):
     n = os.environ.get("PLAYMEMORY_ONNX_THREADS")
     if n:
         so.intra_op_num_threads = int(n)
+        # idle worker threads otherwise busy-spin, which starves other processes (e.g. a local LLM server)
+        so.add_session_config_entry("session.intra_op.allow_spinning", "0")
     return so
 
 
