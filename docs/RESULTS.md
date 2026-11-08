@@ -49,7 +49,65 @@ a bag of lines), a pointer the model can expand (`read_span`), and a smaller num
 distinct places to read. Whether that improves **answers** needs an LLM-judged QA eval
 (not run yet).
 
-## 3. Scale / speed (synthetic clustered text, hash embedder; `python -m bench.run`)
+### 2b. Reranker and more spans (full 1,535 questions, same setup)
+`+rr` = the ONNX cross-encoder (`cross-encoder/ms-marco-MiniLM-L-6-v2`) rescoring the top 30 candidates.
+`spanK` = K scenes sharing the budget. Evidence-recall, all questions:
+
+| system | B=500 | B=1000 | B=2000 | B=4000 |
+|---|---|---|---|---|
+| chunks | 0.406 | 0.542 | 0.647 | 0.757 |
+| **chunks + rerank** | **0.564** | **0.670** | **0.737** | **0.778** |
+| span1 | 0.397 | 0.497 | 0.537 | 0.547 |
+| span2 / span3 | 0.379 / 0.396 | 0.470 / 0.426 | 0.594 / 0.567 | 0.643 / 0.675 |
+| span1 + rerank | 0.521 | 0.621 | 0.652 | 0.659 |
+| span2 + rerank | 0.526 | 0.590 | 0.709 | 0.748 |
+| span3 + rerank | 0.545 | 0.564 | 0.683 | 0.776 |
+
+**The reranker is the largest single improvement in this repo**: +16 points of evidence recall at 500
+characters and +2 at 4,000. Spans with several scenes (span3+rerank) catch up to reranked chunks only at
+the largest budget (0.776 vs 0.778). The one place spans beat reranked chunks is multi-hop at the smallest
+budget (B=500: span3+rr 0.338 vs chunks+rr 0.251); by B=1000 chunks are ahead again (0.387 vs 0.345).
+Cost: scoring 30 passages with the cross-encoder takes about 30 ms on this CPU, versus about 1 ms for
+the search itself. Cutoff, `ask`, graph and replay are covered by tests, not by this benchmark.
+
+## 3. Head-to-head with Memvid (memvid-sdk 2.0.160, identical vectors)
+
+Setup (`bench/vs_memvid.py`): the same 10 conversations, one turn per document/frame, the same
+BGE-small vectors for turns and questions fed to both systems, `k` = 1/5/10, no neighbour context.
+Memvid: `put_many(..., embeddings=...)`, hybrid `find(mode="sem", query_embedding=...)` and
+`mode="lex"`, default settings, telemetry disabled. Evidence-recall@k, all 1,535 questions:
+
+| system | k=1 | k=5 | k=10 | hit@10 |
+|---|---|---|---|---|
+| PlayMemory lexical (BM25) | 0.262 | 0.464 | 0.537 | 0.493 |
+| PlayMemory vector (exact) | 0.267 | 0.496 | 0.594 | 0.534 |
+| **PlayMemory hybrid** | **0.309** | **0.546** | **0.638** | **0.576** |
+| Memvid `sem` (its hybrid) | 0.107 | 0.201 | 0.233 | 0.207 |
+| Memvid `lex` | 0.001 | 0.002 | 0.002 | 0.001 |
+
+| | PlayMemory | Memvid |
+|---|---|---|
+| search latency p50 / p95 (query vector given) | 0.71 / 0.91 ms (hybrid), 0.31 ms (vector) | 0.28 / 0.37 ms (`sem`), 1.64 / 2.75 ms (`lex`) |
+| file size, 10 conversations | 12.3 MB (float32), 7.8 MB (float16) | 34.3 MB |
+| build (1.6k-turn corpus, vectors supplied) | 0.8 s total | 353 s total |
+| open | 9 ms/file | 15 ms/file |
+
+**How to read this, honestly.** This is a retrieval comparison with Memvid in its default configuration
+through its Python SDK, not a verdict on Memvid. What I verified: Memvid's `lex` mode treats a whole
+natural-language question as an implicit AND, so it returns almost nothing for questions (and errored on
+4 of 1,535 queries, counted as empty); and on identical vectors its `sem` results share only 37% of their
+top-10 with exact cosine ranking, and the true top-10 never appears even when asking for 100 results
+(flat at 37% from rank 10 to rank 100). Its HNSW source (Euclidean, M=16, efSearch=50) should do better
+on ~600 vectors, so I could not explain the gap and found no option that closes it; it may be a
+configuration or usage issue on my side (for example how externally supplied embeddings are wired), or
+the way its hybrid mode restricts candidates. Memvid's own headline numbers use an LLM-judged answer
+accuracy, which this does not measure, and I did not test its built-in embedding path. Treat the table as
+"what you get from memvid-sdk 2.0.160 with supplied BGE vectors and defaults", reproducible with the
+commands in `bench/vs_memvid.py`. Search speed is comparable (both well under 2 ms); PlayMemory is
+smaller on disk and about 400x faster to build here, with the caveat that Memvid's build also creates a
+Tantivy index and HNSW graph from scratch.
+
+## 4. Scale / speed (synthetic clustered text, hash embedder; `python -m bench.run`)
 | n | exact (numpy) | HNSW (faiss, persisted) | full hybrid API |
 |---|---|---|---|
 | 100k | recall 1.00, p50 ~7-10 ms | recall 0.996, p50 ~0.6 ms | ~2.2 ms |
@@ -59,4 +117,4 @@ Open time at 100k frames: 2.25 s without a checkpoint, 0.5 s with one.
 ## Known limits
 Single embedder and dataset; no answer-quality metric; scene boundaries use a similarity
 heuristic with `session` metadata as forced boundaries (LoCoMo provides sessions);
-Memvid was not run (no Rust toolchain), so no head-to-head numbers exist yet.
+No answer-quality (LLM-judged) benchmark has been run yet; it needs an LLM API key.

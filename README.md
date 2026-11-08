@@ -27,15 +27,21 @@ return the right *stretch* of it ("watch from 1:30 to 2:10"), not just scattered
 4. [Python API](#python-api)
 5. [Embedders](#embedders)
 6. [Memory cards](#memory-cards)
-7. [CLI](#cli)
-8. [MCP server](#mcp-server)
-9. [Durability and concurrency](#durability-and-concurrency)
-10. [Scaling](#scaling)
-11. [Benchmarks](#benchmarks)
-12. [Honest status](#honest-status)
-13. [Project layout](#project-layout)
-14. [Development](#development)
-15. [Roadmap](#roadmap)
+7. [Ingesting documents](#ingesting-documents)
+8. [Rerank, cutoff, dates and `ask`](#rerank-cutoff-dates-and-ask)
+9. [Security: encryption, signatures, ACL, PII](#security)
+10. [Entity graph and schema](#entity-graph-and-schema)
+11. [Sessions and replay](#sessions-and-replay)
+12. [Progressive enrichment](#progressive-enrichment)
+13. [CLI](#cli)
+14. [MCP server](#mcp-server)
+15. [Durability and concurrency](#durability-and-concurrency)
+16. [Scaling](#scaling)
+17. [Benchmarks](#benchmarks)
+18. [Honest status](#honest-status)
+19. [Project layout](#project-layout)
+20. [Development](#development)
+21. [Roadmap](#roadmap)
 
 ## Install
 
@@ -44,7 +50,12 @@ pip install playmemory              # core: numpy only
 pip install "playmemory[onnx]"      # + local BGE-small embedder (onnxruntime), no torch
 pip install "playmemory[st]"        # + sentence-transformers
 pip install "playmemory[ann]"       # + faiss HNSW for very large memories
-pip install "playmemory[all]"       # onnx + ann
+pip install "playmemory[docs]"      # + PDF / DOCX / XLSX / PPTX ingestion
+pip install "playmemory[crypto]"    # + AES-256-GCM encryption
+pip install "playmemory[audio]"     # + faster-whisper transcription (experimental)
+pip install "playmemory[images]"    # + CLIP image frames (experimental)
+pip install "playmemory[ner]"       # + spaCy entity co-occurrence extractor (experimental)
+pip install "playmemory[all]"       # onnx + ann + docs + crypto
 ```
 
 Requires Python 3.10 or newer. Node.js, npm CLI and Rust packages are not available; they are
@@ -195,6 +206,101 @@ Extraction is pluggable. `RuleExtractor` is the default (regexes for name, resid
 diet, likes and dislikes, goals, relationships). `LLMExtractor(fn)` wraps a callable returning
 rows of `kind/subject/predicate/value[/exclusive]` (for example an LLM call that returns JSON), and any object with `extract(text) -> list[Card]` works.
 
+## Ingesting documents
+
+```python
+rep = m.ingest("notes/")                      # file or directory (recursive; dot-directories skipped)
+rep = m.ingest("report.pdf", max_chars=800, overlap=100, defer_embedding=False)
+rep.files, rep.chunks, rep.skipped_unchanged, rep.replaced, rep.unsupported, rep.failed
+```
+
+Text, Markdown, HTML, CSV/TSV and JSON/JSONL need nothing extra; PDF, DOCX, XLSX and PPTX need
+`playmemory[docs]`. The chunker is heading-aware (each chunk carries `heading`, `section`, `page`,
+`offset`, `source`), keeps tables together and repeats the header row when it must split one, splits
+long paragraphs on sentences, and sets `meta.session` per section so every heading becomes its own
+scene for `recall_span`. Ingest is idempotent: an unchanged file (same SHA-256) is skipped; a changed
+file has its old chunks forgotten first (history stays reachable with `as_of`), or pass
+`on_change="append"`. One unreadable file is reported in `rep.failed` and never aborts a directory.
+
+Audio/video: `m.ingest("talk.mp3", transcriber=WhisperTranscriber("base"))` (extra `audio`) stores one
+frame per segment with `meta.start`/`meta.end`, so a span is a literal "watch 1:30 to 2:10".
+Images: use `ClipEmbedder` as the embedder and `m.add_images(paths, captions)` (extra `images`).
+Both are experimental and only tested with fakes in CI.
+
+## Rerank, cutoff, dates and `ask`
+
+```python
+from playmemory import OnnxCrossEncoder, ClaudeSynthesizer
+
+m.search("where does alice work", k=5, rerank=OnnxCrossEncoder())      # rescore the top 30 (extra onnx)
+m.search("alice", k=20, mode="vector", cutoff=("ratio", 0.5))          # adaptive result count
+m.search("what did we decide last week", when="auto")                  # "yesterday", "last Tuesday", "in March 2023"...
+ans = m.ask("where does alice live?", ClaudeSynthesizer(), k=8)        # answer + citations
+ans.text; ans.citations            # frames the answer cited as [12]; ans.context = everything shown to the model
+```
+
+`cutoff` takes `"elbow"`, `("ratio", x)`, `("cliff", x)` or `("min", x)`. `when` accepts a `(t0, t1)`
+tuple, a phrase, or `"auto"`; spans stay inside the window. `ask(spans=True)` feeds whole scenes instead
+of top-k hits. Synthesizers are any `fn(question, context) -> str`; `ClaudeSynthesizer`
+(Anthropic Messages API, `ANTHROPIC_API_KEY`) and `OpenAICompatSynthesizer` use plain HTTP.
+
+## Security
+
+- **Encryption** (`playmemory[crypto]`): `Memory(path, embedder, password=...)`. Every record payload is
+  AES-256-GCM sealed under a scrypt-derived key; the record's offset is authenticated data, so tampering
+  or swapping records is detected. Frames, tombstones, checkpoints, ANN graphs, events and vector
+  updates are all sealed; only the header (embedder spec, dimension) is readable. CLI: `--password-file`
+  or `PLAYMEMORY_PASSWORD`. A wrong password raises `WrongPasswordError`; none, `EncryptedFileError`.
+- **Signatures**: `m.sign(key)` appends an HMAC-SHA256 over everything before it;
+  `m.verify_signature(key)` returns `(valid, unsigned_trailing_bytes)`.
+- **ACL**: reserved meta keys `tenant`, `visibility` (`public`/`restricted`), `roles`, `groups`. Give the
+  handle (or a call) a `Principal(tenant="acme", roles={"eng"})` and every read path - search, spans,
+  neighbour context, `get`, `seek`, `window`, `read`, `find`, `ask` - honours it. No principal = admin view.
+  `serve --tenant acme --role eng` runs the MCP server as that principal.
+- **PII masking**: `Memory(redact=True)` (or your own `fn(text) -> text`) masks emails, SSNs, IPs,
+  Luhn-valid card numbers and phone numbers in returned text; stored text is untouched. Regex-based, not a guarantee.
+
+## Entity graph and schema
+
+```python
+from playmemory.graph import Graph, Schema
+from playmemory.cards import remember
+
+schema = Schema().declare("lives_in", "one", "entity").declare("likes", "many")
+remember(m, "Alice lives in Paris and loves tea", schema=schema)
+g = Graph(m, schema)
+g.triples(subject="alice"); g.neighbors("alice"); g.related("alice", hops=2)   # time-aware: as_of= on each
+m.search("tell me about Alice", graph=g)     # frames about entities named in the query join the fusion
+```
+
+The graph is a view over memory cards, so it stays consistent with `supersede`, `forget` and `as_of`.
+The schema validates value types (`int`, `float`, `date`, `bool`, `entity`), allowed card kinds, and
+decides one-vs-many cardinality. `NerExtractor` (spaCy, extra `ner`) is experimental.
+
+## Sessions and replay
+
+```python
+with m.session("tuning run") as sid:
+    m.search("topic1 word3", k=5)
+    ...
+m.sessions(); m.events(sid)
+diffs = m.replay(sid, mode="vector", rerank=my_reranker)    # same questions, other settings
+for d in diffs: print(d.event["p"]["query"], d.same, d.added, d.removed, d.reordered)
+```
+
+Inside a session every search, span, add and forget is logged in the file (sealed if the file is
+encrypted) with its parameters, results, principal and the frame/tombstone counts at that moment.
+`replay` re-runs the reads against the memory *as it was then*, even after later writes, so it
+reproduces the original results exactly and shows what a different setting would have changed.
+`compact(keep_history=True)` keeps the trail; plain `compact()` drops it because ids change.
+
+## Progressive enrichment
+
+`m.add_many(texts, defer_embedding=True)` (or `ingest(..., defer_embedding=True)` / `--defer-embedding`)
+stores frames at once - keyword-searchable immediately - and `m.enrich()` / `playmemory FILE enrich`
+embeds them in batches later. Enriched vectors are append-only update records; they survive reopen,
+checkpoint, compaction, encryption, float16 and `doctor`, and reader handles pick them up on `refresh()`.
+
 ## CLI
 
 ```bash
@@ -211,6 +317,10 @@ playmemory agent.pmem window 10 20
 playmemory agent.pmem forget 7
 playmemory agent.pmem stats | verify | checkpoint | export
 playmemory agent.pmem doctor [--write [--replace]]   # salvage intact records after mid-file damage
+playmemory agent.pmem ingest docs/ report.pdf [--defer-embedding] [--transcribe base]
+playmemory agent.pmem enrich                         # embed frames ingested with --defer-embedding
+playmemory agent.pmem search "standup" --when "last week" --rerank --cutoff ratio:0.5
+playmemory agent.pmem ask "where does alice live?" --llm claude[:MODEL] [--spans]
 playmemory agent.pmem compact [--keep-history]
 playmemory agent.pmem serve                          # MCP over stdio
 ```
@@ -232,8 +342,9 @@ other MCP client:
 }
 ```
 
-Tools: `remember`, `recall`, `recall_story`, `read_span`, `forget`, `seek`, `timeline`,
-`profile`, `stats`.
+Tools: `remember`, `recall` (with `when`), `recall_story`, `read_span`, `forget`, `seek`, `timeline`,
+`profile`, `stats`, and `ingest` only when started with `--ingest-root DIR` (paths outside the roots are refused).
+`serve --tenant T --role R --redact` runs it as an ACL principal with PII masking.
 
 ## Durability and concurrency
 
@@ -281,15 +392,19 @@ Full tables, per-category numbers and caveats are in [docs/RESULTS.md](docs/RESU
 
 ## Honest status
 
-- Hybrid search clearly beats BM25-only or vector-only on LoCoMo.
-- Span retrieval **matches** top-k chunks at small budgets (around 500 characters) but does
-  **not** beat them on evidence recall at larger budgets: a scene holds about 8 turns and then
-  plateaus. Whether contiguous scenes improve *final answers* is untested; there is no LLM judge yet.
+- Hybrid search clearly beats BM25-only or vector-only on LoCoMo; the ONNX cross-encoder reranker is
+  the largest single gain (+16 points of evidence recall at a 500-character budget).
+- Span retrieval **matches** top-k chunks at small budgets but does **not** beat them on evidence recall
+  overall (it wins only on multi-hop at the smallest budget). Whether contiguous scenes improve *final
+  answers* is untested: there is no LLM-judged QA benchmark yet (it needs an API key).
+- Head-to-head with `memvid-sdk` 2.0.160 on identical vectors: PlayMemory hybrid 0.638 evidence-recall@10
+  vs 0.233 for Memvid's default hybrid mode, with comparable search speed and smaller files. I could not
+  explain Memvid's low recall (it returns only 37% of the exact top-10), so treat it as "defaults through
+  the Python SDK", not a verdict on Memvid; details and caveats in [docs/RESULTS.md](docs/RESULTS.md).
 - The metric is retrieval only, on one dataset and one embedder.
-- The timeline model is not a speed trick. The original segment-index speed claim did not hold
-  up; the value is temporal context, time travel, a portable single file and cheap appends.
-- Memvid was not run (no Rust toolchain), so there are no head-to-head numbers. Compared with
-  Memvid (Rust, multimodal, encryption, graph) this is a smaller Python engine.
+- Experimental, tested only with fakes in CI: audio transcription, CLIP images, spaCy NER.
+- Not done: Node.js / npm / Rust packages, an HTTP server, and the "sketch" candidate prefilter (profiling
+  did not justify it below ~1M frames).
 - `HashEmbedder` (`"debug"`) is non-semantic; production code must pass a real embedder.
 
 ## Project layout
@@ -302,6 +417,11 @@ src/playmemory/
   ann.py        AnnIndex (faiss HNSW, persisted)
   index.py      VectorMatrix (growing embedding matrix)
   doctor.py     diagnose/salvage a damaged file
+  ingest/       chunker, loaders (text/html/csv/json/pdf/docx/xlsx/pptx), audio
+  crypto.py     scrypt + AES-256-GCM, HMAC
+  acl.py pii.py tenant/role access control, PII masking
+  graph.py      entity graph + predicate schema
+  rerank.py cutoff.py temporal.py ask.py   retrieval extras
   episodes.py   scene segmentation and EpisodeIndex
   cards.py      memory cards, extractors, remember(), profile()
   embed.py      embedders and from_spec()

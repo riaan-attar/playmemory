@@ -90,17 +90,24 @@ def memvid(args):
         t0 = time.perf_counter()
         m = memvid_sdk.use("basic", path, mode="open", enable_vec=True, enable_lex=True)
         open_s = time.perf_counter() - t0
-        row = {"id": c["id"], "build_s": build, "open_s": open_s, "bytes": size, "sem": [], "lex": [], "lat_sem": [], "lat_lex": []}
+        row = {"id": c["id"], "build_s": build, "open_s": open_s, "bytes": size, "sem": [], "lex": [],
+               "lat_sem": [], "lat_lex": [], "errors": {"sem": 0, "lex": 0}, "first_error": None}
         for qi, q in enumerate(c["questions"]):
             qv = E["questions"][qi].tolist()
             for mode, key in (("sem", "sem"), ("lex", "lex")):
                 t0 = time.perf_counter()
-                r = m.find(q["q"], k=max(KS), mode=mode, query_embedding=qv, query_embedding_model=D["embedder"])
+                try:
+                    r = m.find(q["q"], k=max(KS), mode=mode, query_embedding=qv, query_embedding_model=D["embedder"])
+                    hits = [h.get("title") for h in r["hits"]]
+                except Exception as e:  # counted as "no results" and reported, never hidden
+                    hits = []
+                    row["errors"][key] += 1
+                    row["first_error"] = row["first_error"] or {"mode": mode, "query": q["q"], "error": f"{type(e).__name__}: {str(e)[:120]}"}
                 row["lat_" + key].append(time.perf_counter() - t0)
-                row[key].append([h.get("title") for h in r["hits"]])
+                row[key].append(hits)
         m.close()
         res["convs"].append(row)
-        print(f"{c['id']}: build {build:.1f}s open {open_s*1000:.0f}ms {size/1e6:.1f}MB", flush=True)
+        print(f"{c['id']}: build {build:.1f}s open {open_s*1000:.0f}ms {size/1e6:.1f}MB errors={row['errors']} {row['first_error'] or ''}", flush=True)
     json.dump(res, open(out / "memvid.json", "w"))
 
 
@@ -191,6 +198,8 @@ def evaluate(args):
     print("\nstorage (10 conversations):")
     print(f"  playmemory  {pm['bytes']/1e6:7.1f} MB (float32)  {pm['bytes_f16']/1e6:7.1f} MB (float16)  build {pm['build_s']:.1f}s  open {pm['open_s']*1000/len(D['convs']):.0f} ms/file")
     if MV:
+        errs = {m: sum(r["errors"][m] for r in MV["convs"]) for m in ("sem", "lex")}
+        print(f"  memvid query errors (counted as empty results): {errs}")
         print(f"  memvid      {sum(r['bytes'] for r in MV['convs'])/1e6:7.1f} MB                     build {sum(r['build_s'] for r in MV['convs']):.1f}s  open {sum(r['open_s'] for r in MV['convs'])*1000/len(MV['convs']):.0f} ms/file")
     json.dump({"systems": {k: v for k, v in systems.items()}, "n": n}, open(out / "eval.json", "w"))
 
