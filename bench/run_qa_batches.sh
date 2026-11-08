@@ -5,7 +5,7 @@
 #
 # Per batch: run `python -m bench.qa` (resumes from the fsynced cache), retry with growing backoff on any
 # failure (memory pressure, Ollama hiccup, another run holding the lock), then commit the results.
-# Env knobs: TOTAL=300 BATCH=100 THREADS=8 MIN_FREE_MB=3000 MAX_ATTEMPTS=6 BACKOFF=300 RUNNER=<cmd for tests>
+# Env knobs: TOTAL=300 BATCH=100 THREADS=8 (ONNX) OLLAMA_THREADS=4 (more made Ollama's GPU runner thrash here) MIN_FREE_MB=3000 MAX_ATTEMPTS=6 BACKOFF=300 RUNNER=<cmd for tests>
 set -u
 cd "$(dirname "$0")/.."
 : "${DATA:?set DATA to the path of locomo10.json}"
@@ -24,7 +24,7 @@ rows() { [ -f "$CACHE" ] && wc -l < "$CACHE" || echo 0; }
 export PLAYMEMORY_ONNX_THREADS=$THREADS OMP_NUM_THREADS=$THREADS
 default_runner() {
   nice -n 10 .venv/bin/python -m bench.qa --data "$DATA" --start "$1" --count "$BATCH" --llm "$LLM" \
-    --ollama-opt num_batch=64 --ollama-opt num_ctx=2048 --ollama-opt num_thread="$THREADS" \
+    --ollama-opt num_batch=64 --ollama-opt num_ctx=2048 --ollama-opt num_thread="${OLLAMA_THREADS:-4}" \
     --judge f1 --budget 2000 --cache "$CACHE" --min-free-mb "$MIN_FREE_MB"
 }
 run_batch() { if [ -n "${RUNNER:-}" ]; then $RUNNER "$1"; else default_runner "$1"; fi; }
