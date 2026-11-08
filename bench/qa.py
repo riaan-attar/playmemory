@@ -26,6 +26,20 @@ from bench.quality import CATS, load_turns
 from playmemory import ClaudeSynthesizer, EpisodeConfig, Memory, OnnxCrossEncoder, from_spec
 from playmemory.ask import build_context
 
+def load_dotenv(path: str = ".env") -> None:
+    """Minimal .env reader (KEY=VALUE lines); real environment variables win."""
+    import os
+
+    f = Path(path)
+    if not f.exists():
+        return
+    for line in f.read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip("\"'"))
+
+
 JUDGE_SYSTEM = ("You grade answers to questions about a long conversation. Reply with exactly one word: "
                 "CORRECT if the model answer conveys the same facts as the gold answer (extra detail is fine, "
                 "dates may be phrased differently), otherwise WRONG.")
@@ -114,6 +128,7 @@ def main():
     ap.add_argument("--cache", default="qa_cache.jsonl")
     ap.add_argument("--no-rerank", action="store_true")
     a = ap.parse_args()
+    load_dotenv()
     data = json.load(open(a.data))
     emb = CachedEmbedder(from_spec(a.embedder))
     rr = None if a.no_rerank else CachedReranker(OnnxCrossEncoder())

@@ -9,3 +9,5 @@ dist/
 build/
 *.egg-info/
 graphify-out/
+.env
+qa_cache.jsonl
