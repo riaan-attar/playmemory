@@ -6,3 +6,34 @@
 2026-11-08 22:42:31  batch 0: attempt 1 | rows=363 | used 7364 MB, avail 8316 MB, swap 2312 MB
 2026-11-08 22:48:17  supervisor start: total=300 batch=100 threads=4 min_free=3000MB | rows=366 | used 7250 MB, avail 8430 MB, swap 2375 MB
 2026-11-08 22:48:17  batch 0: attempt 1 | rows=366 | used 7251 MB, avail 8429 MB, swap 2375 MB
+2026-11-08 23:10:00  supervisor start: total=300 batch=100 threads=4 min_free=3000MB | rows=537 | used 4687 MB, avail 10993 MB, swap 2512 MB
+2026-11-08 23:10:00  batch 0: attempt 1 | rows=537 | used 4687 MB, avail 10993 MB, swap 2512 MB
+2026-11-08 23:10:02  batch 0: DONE (rows=537)
+LoCoMo answer accuracy, budget=2000 chars, answering=ollama:hermes3:3b, scoring=f1, questions 0-99 (this batch), 0 new calls, 0s
+
+system      group          correct      F1     n
+chunks      all              0.200   0.270   100
+chunks+rr   all              0.250   0.263   100
+span2+rr    all              0.250   0.240   100
+span3+rr    all              0.300   0.259   100
+
+chunks      multi-hop        0.048   0.196    21
+chunks+rr   multi-hop        0.095   0.224    21
+span2+rr    multi-hop        0.143   0.242    21
+span3+rr    multi-hop        0.143   0.227    21
+
+chunks      temporal         0.000   0.202    20
+chunks+rr   temporal         0.000   0.151    20
+span2+rr    temporal         0.000   0.124    20
+span3+rr    temporal         0.000   0.139    20
+
+chunks      open-domain      0.000   0.179     6
+chunks+rr   open-domain      0.167   0.149     6
+span2+rr    open-domain      0.000   0.055     6
+span3+rr    open-domain      0.167   0.109     6
+
+chunks      single-hop       0.358   0.334    53
+chunks+rr   single-hop       0.415   0.333    53
+span2+rr    single-hop       0.415   0.303    53
+span3+rr    single-hop       0.491   0.334    53
+
