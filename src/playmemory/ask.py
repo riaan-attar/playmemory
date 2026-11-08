@@ -79,13 +79,13 @@ class OpenAICompatSynthesizer:
     """Any OpenAI-compatible /chat/completions endpoint (OpenAI, Ollama, vLLM, ...)."""
 
     def __init__(self, model: str, url: str = "https://api.openai.com/v1/chat/completions",
-                 api_key: str | None = None, max_tokens: int = 512, timeout: float = 60.0):
-        self.model, self.url, self.max_tokens, self.timeout = model, url, max_tokens, timeout
+                 api_key: str | None = None, max_tokens: int = 512, timeout: float = 60.0, system: str = SYSTEM):
+        self.model, self.url, self.max_tokens, self.timeout, self.system = model, url, max_tokens, timeout, system
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
 
     def __call__(self, question: str, context: str) -> str:
         body = {"model": self.model, "max_tokens": self.max_tokens, "messages": [
-            {"role": "system", "content": SYSTEM},
+            {"role": "system", "content": self.system},
             {"role": "user", "content": f"Memory passages:\n{context}\n\nQuestion: {question}"}]}
         headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
         return _post(self.url, headers, body, self.timeout)["choices"][0]["message"]["content"].strip()

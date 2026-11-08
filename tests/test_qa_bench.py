@@ -1,6 +1,8 @@
 import json
 
-from bench.qa import SYSTEMS, frames_for, report, run
+import pytest
+
+from bench.qa import SYSTEMS, f1_and_contains, frames_for, report, run
 from playmemory import EpisodeConfig, Memory
 
 CONV = {"speaker_a": "A", "speaker_b": "B", "session_1_date_time": "1 May 2023", "session_1": [
@@ -29,6 +31,7 @@ def test_pipeline_with_fake_llm_and_cache(tmp_path):
     score, calls = run(data(), HashEmbedder(), answer=answer, judge=judge, budget=400, sample=0, rr=None,
                        cache_path=str(cache), systems=("chunks", "span2"))
     assert calls == 2 * 2 * 2  # 2 questions x 2 systems x (answer + judge); adversarial skipped
+    assert 'f1' in __import__('json').loads(cache.read_text().splitlines()[0])
     assert score[("chunks", "all")] == [1.0, 1.0] and score[("span2", "single-hop")] == [1.0, 1.0]
     assert any("[1]" in ctx and "Rex" in ctx for q, ctx in seen)  # passages arrive numbered with their ids
     # second run is served entirely from the cache
@@ -52,3 +55,19 @@ def test_report_prints(capsys):
     report({("chunks", "all"): [1.0, 0.0], ("chunks", "single-hop"): [1.0]}, systems=("chunks",))
     out = capsys.readouterr().out
     assert "0.500" in out and "single-hop" in out
+
+
+def test_f1_and_contains():
+    assert f1_and_contains("7 May 2023", "She went on 7 May 2023.") == (pytest.approx(2 / 3), True)
+    assert f1_and_contains("Rex", "The dog is called Rex") [1] is True
+    assert f1_and_contains("Rome", "Paris") == (0.0, False)
+    assert f1_and_contains("the red car", "A red car")[0] == 1.0  # articles ignored
+    assert f1_and_contains("x", "") == (0.0, False)
+
+
+def test_pipeline_without_llm_judge_uses_f1(tmp_path):
+    from playmemory import HashEmbedder
+    score, calls = run(data(), HashEmbedder(), answer=lambda q, c: "It is Rex" if "dog" in q else "Paris",
+                       judge=None, budget=400, sample=0, rr=None, cache_path=None, systems=("chunks",))
+    assert calls == 2 and score[("chunks", "all")] == [1.0, 0.0]  # contains-gold decides
+    assert score[("chunks", "all", "f1")][0] >= 0.5 and score[("chunks", "all", "f1")][1] == 0.0

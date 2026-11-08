@@ -7,7 +7,8 @@ For each question every system builds a context under the same character budget,
 answers from it, and a second call judges the answer against the gold answer (CORRECT/WRONG).
 Systems: chunks, chunks+rr, span2+rr, span3+rr (rr = ONNX cross-encoder). Results are cached in
 --cache (JSONL) so an interrupted run resumes without paying twice. Category 5 (adversarial) skipped.
-Cost: sample x systems x 2 calls (a few thousand small calls for the full set).
+Cost: sample x systems calls (x2 with an LLM judge). Scoring defaults to token F1 + contains-gold, which
+needs no judge and works with a small local model:  --llm ollama:hermes3:3b --judge f1
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ import numpy as np
 
 from bench.budget import CachedEmbedder, CachedReranker
 from bench.quality import CATS, load_turns
-from playmemory import ClaudeSynthesizer, EpisodeConfig, Memory, OnnxCrossEncoder, from_spec
+from playmemory import ClaudeSynthesizer, OpenAICompatSynthesizer, EpisodeConfig, Memory, OnnxCrossEncoder, from_spec
 from playmemory.ask import build_context
 
 def load_dotenv(path: str = ".env") -> None:
@@ -38,6 +39,28 @@ def load_dotenv(path: str = ".env") -> None:
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip().strip("\"'"))
+
+
+SHORT_SYSTEM = ("Answer the question using ONLY the numbered memory passages. Reply with the shortest possible "
+                "answer (a few words, no explanation, no citations). If the passages do not say, reply: unknown.")
+
+
+def _norm(t: str) -> list[str]:
+    t = re.sub(r"\b(a|an|the)\b", " ", str(t).lower())
+    return re.sub(r"[^\w\s]", " ", t).split()
+
+
+def f1_and_contains(gold, pred) -> tuple[float, bool]:
+    """LoCoMo-style token F1, and whether every gold token appears in the answer."""
+    g, p = _norm(gold), _norm(pred)
+    if not g or not p:
+        return 0.0, False
+    common = sum(min(g.count(w), p.count(w)) for w in set(g))
+    contains = all(w in p for w in g)
+    if common == 0:
+        return 0.0, contains
+    pr, rc = common / len(p), common / len(g)
+    return 2 * pr * rc / (pr + rc), contains
 
 
 JUDGE_SYSTEM = ("You grade answers to questions about a long conversation. Reply with exactly one word: "
@@ -94,27 +117,43 @@ def run(data, embedder, *, answer, judge, budget, sample, rr, cache_path, seed=0
                 else:
                     ctx = build_context(frames_for(mem, system, qa["question"], budget, rr))
                     pred = answer(qa["question"], ctx)
-                    verdict = judge(f"Question: {qa['question']}\nGold answer: {qa['answer']}", f"Model answer: {pred}")
+                    f1, contains = f1_and_contains(qa["answer"], pred)
                     r = {"conv": smp["sample_id"], "q": qa["question"], "system": system, "cat": qa["category"],
-                         "pred": pred, "correct": verdict.strip().upper().startswith("CORRECT")}
-                    calls += 2
+                         "pred": pred, "f1": f1, "contains": contains, "correct": contains}
+                    calls += 1
+                    if judge is not None:
+                        verdict = judge(f"Question: {qa['question']}\nGold answer: {qa['answer']}", f"Model answer: {pred}")
+                        r["correct"] = verdict.strip().upper().startswith("CORRECT")
+                        calls += 1
                     cache[key] = r
                     if out:
                         out.write(json.dumps(r) + "\n")
                         out.flush()
                 for g in ("all", CATS[r["cat"]]):
                     score[(system, g)].append(float(r["correct"]))
+                    score[(system, g, "f1")].append(float(r.get("f1", 0.0)))
     return score, calls
 
 
 def report(score, systems=SYSTEMS):
-    print(f"{'system':<12}{'group':<13}{'accuracy':>9}{'n':>6}")
+    print(f"{'system':<12}{'group':<13}{'correct':>9}{'F1':>8}{'n':>6}")
     for g in ("all", *CATS.values()):
         for s in systems:
             v = score.get((s, g), [])
             if v:
-                print(f"{s:<12}{g:<13}{np.mean(v):>9.3f}{len(v):>6}")
+                print(f"{s:<12}{g:<13}{np.mean(v):>9.3f}{np.mean(score.get((s, g, 'f1'), [0.0])):>8.3f}{len(v):>6}")
         print()
+
+
+def make_llm(spec: str, system: str, max_tokens: int):
+    kind, _, rest = spec.partition(":")
+    if kind == "claude":
+        return ClaudeSynthesizer(rest or "claude-haiku-5-5", max_tokens=max_tokens, system=system)
+    if kind in ("ollama", "openai"):
+        model, _, url = rest.partition("@")
+        default = "http://localhost:11434/v1/chat/completions" if kind == "ollama" else "https://api.openai.com/v1/chat/completions"
+        return OpenAICompatSynthesizer(model, url or default, max_tokens=max_tokens, system=system, timeout=300.0)
+    raise SystemExit(f"unknown llm spec {spec!r}")
 
 
 def main():
@@ -123,8 +162,10 @@ def main():
     ap.add_argument("--embedder", default="onnx")
     ap.add_argument("--sample", type=int, default=300, help="random questions to evaluate (0 = all)")
     ap.add_argument("--budget", type=int, default=2000)
-    ap.add_argument("--answer-model", default="claude-haiku-5-5")
-    ap.add_argument("--judge-model", default="claude-haiku-5-5")
+    ap.add_argument("--llm", default="claude:claude-haiku-5-5",
+                    help="answering model: claude:MODEL | ollama:MODEL[@URL] | openai:MODEL[@URL]")
+    ap.add_argument("--judge", default="f1",
+                    help="f1 (token F1 + contains-gold, no LLM judge) | claude:MODEL | ollama:MODEL")
     ap.add_argument("--cache", default="qa_cache.jsonl")
     ap.add_argument("--no-rerank", action="store_true")
     a = ap.parse_args()
@@ -132,14 +173,14 @@ def main():
     data = json.load(open(a.data))
     emb = CachedEmbedder(from_spec(a.embedder))
     rr = None if a.no_rerank else CachedReranker(OnnxCrossEncoder())
-    answer = ClaudeSynthesizer(a.answer_model, max_tokens=200)
-    judge_llm = ClaudeSynthesizer(a.judge_model, max_tokens=5, system=JUDGE_SYSTEM)
+    answer = make_llm(a.llm, SHORT_SYSTEM, 60)
+    judge_llm = None if a.judge == "f1" else make_llm(a.judge, JUDGE_SYSTEM, 5)
     systems = SYSTEMS if rr else ("chunks", "span2", "span3")
     t0 = time.perf_counter()
-    score, calls = run(data, emb, answer=answer, judge=lambda q, c: judge_llm(q, c), budget=a.budget,
+    score, calls = run(data, emb, answer=answer, judge=(None if judge_llm is None else (lambda q, c: judge_llm(q, c))), budget=a.budget,
                        sample=a.sample, rr=rr, cache_path=a.cache, systems=systems)
-    print(f"\nLoCoMo LLM-judged accuracy, budget={a.budget} chars, {a.answer_model} answering, "
-          f"{a.judge_model} judging, {calls} new calls, {time.perf_counter()-t0:.0f}s\n")
+    print(f"\nLoCoMo answer accuracy, budget={a.budget} chars, answering={a.llm}, scoring={a.judge}, "
+          f"{calls} new calls, {time.perf_counter()-t0:.0f}s\n")
     report(score, systems)
 
 
