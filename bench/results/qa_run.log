@@ -86,3 +86,6 @@ chunks+rr   single-hop       0.472   0.350   108
 span2+rr    single-hop       0.491   0.333   108
 span3+rr    single-hop       0.500   0.334   108
 
+2026-11-08 23:30:37  batch 100: results committed to git
+2026-11-08 23:30:41  batch 100: pushed to origin
+2026-11-08 23:30:41  batch 200: attempt 1 | rows=860 | used 4476 MB, avail 11204 MB, swap 2499 MB

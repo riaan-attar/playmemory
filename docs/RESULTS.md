@@ -107,6 +107,37 @@ commands in `bench/vs_memvid.py`. Search speed is comparable (both well under 2 
 smaller on disk and about 400x faster to build here, with the caveat that Memvid's build also creates a
 Tantivy index and HNSW graph from scratch.
 
+## 3b. Answer quality with a small local model (LoCoMo, hermes3:3b via Ollama, 2,000-char budget)
+
+Retrieval-only metrics cannot say whether a scene helps the model *answer*. This run has `hermes3:3b` answer
+from each system's context and scores it by token F1 and "answer contains every gold token" (no LLM judge; no API
+key was available). 215 questions were answered by all four systems (860 answers) and are compared on the same
+questions (`bench/qa.py`, saved in `bench/results/`, including the exact contexts):
+
+| contains-gold | n | chunks | chunks+rerank | 2 scenes+rerank | 3 scenes+rerank |
+|---|---|---|---|---|---|
+| all | 215 | 0.260 | 0.298 | 0.302 | **0.312** |
+| single-hop | 117 | 0.410 | 0.479 | 0.487 | 0.496 |
+| multi-hop | 43 | 0.070 | 0.047 | 0.070 | 0.070 |
+| temporal | 45 | 0.111 | 0.111 | 0.111 | 0.111 |
+
+Token F1 (all): 0.267 / 0.276 / 0.270 / 0.266, i.e. no difference. Paired bootstrap of the contains-gold
+difference vs plain chunks: reranked chunks +3.7 pts [-0.9, +8.4] and 2 scenes +4.2 [-0.9, +9.8] are within
+noise; 3 scenes +5.1 [+0.5, +9.8] just clears zero, but with three comparisons and 215 questions I would not
+call it established.
+
+**Reading it honestly.** Reranking and scenes give a small, directionally consistent lift on single-hop questions
+(about +7 to +9 points); nothing helps multi-hop or temporal questions, which a 3B model cannot answer anyway
+(temporal needs date arithmetic it does not do: 0.111 for every system). The model often copies a whole evidence
+line instead of a short answer, so "contains gold" partly measures whether the evidence was in the context and
+F1 is penalised by the extra words; absolute numbers are low and only the comparison between systems is
+meaningful. A stronger answering model and an LLM judge (`--llm claude:...`, `--judge claude:...`) are the next test.
+
+Operational note from running this on a 16 GB laptop with an integrated GPU: Ollama caches every distinct prompt
+(~70 MB each); after ~60 prompts its runner held 4-5 GB and calls became ~20x slower. `bench/qa.py` therefore
+unloads the model every 25 calls, and `bench/run_qa_batches.sh` runs unattended with a memory guard, a lock and
+per-batch commits.
+
 ## 4. Scale / speed (`python -m bench.scale`, synthetic clustered vectors)
 | frames x dim | add | open (checkpointed) | exact scan | BM25 | HNSW | full hybrid API | file | peak RSS |
 |---|---|---|---|---|---|---|---|---|
