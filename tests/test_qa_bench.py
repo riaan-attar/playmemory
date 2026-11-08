@@ -1,0 +1,54 @@
+import json
+
+from bench.qa import SYSTEMS, frames_for, report, run
+from playmemory import EpisodeConfig, Memory
+
+CONV = {"speaker_a": "A", "speaker_b": "B", "session_1_date_time": "1 May 2023", "session_1": [
+    {"speaker": "A", "dia_id": f"D1:{i}", "text": t} for i, t in enumerate(
+        ["I adopted a dog named Rex", "Rex loves the park", "I work as a nurse", "Nursing is tiring",
+         "We plan a trip to Rome", "Rome has great food"], start=1)]}
+
+
+def data():
+    qa = [{"question": "What is the dog called?", "answer": "Rex", "category": 4, "evidence": ["D1:1"]},
+          {"question": "Where is the trip?", "answer": "Rome", "category": 4, "evidence": ["D1:5"]},
+          {"question": "Adversarial?", "answer": None, "category": 5, "evidence": []}]
+    return [{"sample_id": "conv-x", "conversation": CONV, "qa": qa}]
+
+
+def test_pipeline_with_fake_llm_and_cache(tmp_path):
+    cache = tmp_path / "c.jsonl"
+    seen = []
+
+    def answer(q, ctx):
+        seen.append((q, ctx))
+        return "Rex" if "dog" in q else "Rome"
+
+    judge = lambda q, c: "CORRECT" if c.split("Model answer:")[1].strip() in q else "WRONG"
+    from playmemory import HashEmbedder
+    score, calls = run(data(), HashEmbedder(), answer=answer, judge=judge, budget=400, sample=0, rr=None,
+                       cache_path=str(cache), systems=("chunks", "span2"))
+    assert calls == 2 * 2 * 2  # 2 questions x 2 systems x (answer + judge); adversarial skipped
+    assert score[("chunks", "all")] == [1.0, 1.0] and score[("span2", "single-hop")] == [1.0, 1.0]
+    assert any("[1]" in ctx and "Rex" in ctx for q, ctx in seen)  # passages arrive numbered with their ids
+    # second run is served entirely from the cache
+    score2, calls2 = run(data(), HashEmbedder(), answer=lambda *a: 1 / 0, judge=lambda *a: 1 / 0, budget=400,
+                         sample=0, rr=None, cache_path=str(cache), systems=("chunks", "span2"))
+    assert calls2 == 0 and score2 == score
+    assert len(cache.read_text().splitlines()) == 4 and json.loads(cache.read_text().splitlines()[0])["correct"] is True
+
+
+def test_frames_for_respects_budget_and_systems():
+    m = Memory(embedder="debug", episode_config=EpisodeConfig())
+    m.add_many([f"turn {i} about topic{i % 3} filler words here" for i in range(30)], metas=[{"session": i // 10} for i in range(30)],
+               times=[float(i) for i in range(30)])
+    for s in ("chunks", "span2", "span3"):
+        fr = frames_for(m, s, "topic1", 150, None)
+        assert fr and sum(len(f.text) + 1 for f in fr) <= 150 + 60
+    assert "chunks+rr" in SYSTEMS
+
+
+def test_report_prints(capsys):
+    report({("chunks", "all"): [1.0, 0.0], ("chunks", "single-hop"): [1.0]}, systems=("chunks",))
+    out = capsys.readouterr().out
+    assert "0.500" in out and "single-hop" in out

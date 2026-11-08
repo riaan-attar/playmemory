@@ -128,7 +128,7 @@ class MemoryServer:
         try:
             if method == "initialize":
                 result = {"protocolVersion": PROTOCOL, "capabilities": {"tools": {}},
-                          "serverInfo": {"name": "playmemory", "version": "0.3.0"}}
+                          "serverInfo": {"name": "playmemory", "version": "0.4.0"}}
             elif method == "ping":
                 result = {}
             elif method == "tools/list":

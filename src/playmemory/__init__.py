@@ -12,7 +12,7 @@ from .frame import Frame, Hit, Span
 from .memory import Memory, ReplayDiff
 from .store import CorruptFileError, LockedError, ModelMismatchError
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "Memory", "ReplayDiff", "Principal", "mask_pii", "Answer", "ClaudeSynthesizer", "OpenAICompatSynthesizer", "Reranker", "OnnxCrossEncoder",

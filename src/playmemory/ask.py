@@ -61,15 +61,15 @@ class ClaudeSynthesizer:
     """Anthropic Messages API over plain HTTP. Key from api_key or ANTHROPIC_API_KEY."""
 
     def __init__(self, model: str = "claude-haiku-5-5", api_key: str | None = None, max_tokens: int = 512,
-                 base_url: str = "https://api.anthropic.com", timeout: float = 60.0):
-        self.model, self.max_tokens, self.timeout = model, max_tokens, timeout
+                 base_url: str = "https://api.anthropic.com", timeout: float = 60.0, system: str = SYSTEM):
+        self.model, self.max_tokens, self.timeout, self.system = model, max_tokens, timeout, system
         self.url = base_url.rstrip("/") + "/v1/messages"
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
         if not self.api_key:
             raise ValueError("ClaudeSynthesizer needs api_key or ANTHROPIC_API_KEY")
 
     def __call__(self, question: str, context: str) -> str:
-        body = {"model": self.model, "max_tokens": self.max_tokens, "system": SYSTEM,
+        body = {"model": self.model, "max_tokens": self.max_tokens, "system": self.system,
                 "messages": [{"role": "user", "content": f"Memory passages:\n{context}\n\nQuestion: {question}"}]}
         out = _post(self.url, {"x-api-key": self.api_key, "anthropic-version": "2023-06-01"}, body, self.timeout)
         return "".join(b.get("text", "") for b in out["content"] if b.get("type") == "text").strip()
