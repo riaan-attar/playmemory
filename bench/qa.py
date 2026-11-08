@@ -116,7 +116,8 @@ def run(data, embedder, *, answer, judge, budget, sample, rr, cache_path, seed=0
                     r = cache[key]
                 else:
                     ctx = build_context(frames_for(mem, system, qa["question"], budget, rr))
-                    pred = answer(qa["question"], ctx)
+                    raw = answer(qa["question"], ctx) or ""
+                    pred = raw.strip().splitlines()[0] if raw.strip() else ""  # small models add explanations; score the answer line
                     f1, contains = f1_and_contains(qa["answer"], pred)
                     r = {"conv": smp["sample_id"], "q": qa["question"], "system": system, "cat": qa["category"],
                          "pred": pred, "f1": f1, "contains": contains, "correct": contains}
@@ -145,11 +146,40 @@ def report(score, systems=SYSTEMS):
         print()
 
 
-def make_llm(spec: str, system: str, max_tokens: int):
+class OllamaChat:
+    """Ollama's native /api/chat (lets us set options such as num_gpu=0 to stay on CPU) with retries:
+    a crashed runner (e.g. GPU out of memory) is restarted by the server, so a retry usually works."""
+
+    def __init__(self, model, system, max_tokens=60, url="http://localhost:11434", options=None, retries=3):
+        self.model, self.system, self.url, self.retries = model, system, url.rstrip("/"), retries
+        self.options = {"num_predict": max_tokens, "temperature": 0, "num_ctx": 4096, **(options or {})}
+
+    def __call__(self, question, context):
+        import urllib.error
+        import urllib.request
+
+        body = json.dumps({"model": self.model, "stream": False, "options": self.options, "messages": [
+            {"role": "system", "content": self.system},
+            {"role": "user", "content": f"Memory passages:\n{context}\n\nQuestion: {question}"}]}).encode()
+        for attempt in range(self.retries):
+            try:
+                req = urllib.request.Request(self.url + "/api/chat", body, {"Content-Type": "application/json"})
+                with urllib.request.urlopen(req, timeout=600) as r:
+                    return json.load(r)["message"]["content"].strip()
+            except (urllib.error.URLError, ConnectionError, TimeoutError):
+                if attempt == self.retries - 1:
+                    raise
+                time.sleep(5 * (attempt + 1))
+
+
+def make_llm(spec: str, system: str, max_tokens: int, ollama_options=None):
     kind, _, rest = spec.partition(":")
     if kind == "claude":
         return ClaudeSynthesizer(rest or "claude-haiku-5-5", max_tokens=max_tokens, system=system)
-    if kind in ("ollama", "openai"):
+    if kind == "ollama":
+        model, _, url = rest.partition("@")
+        return OllamaChat(model, system, max_tokens, url or "http://localhost:11434", ollama_options)
+    if kind == "openai":
         model, _, url = rest.partition("@")
         default = "http://localhost:11434/v1/chat/completions" if kind == "ollama" else "https://api.openai.com/v1/chat/completions"
         return OpenAICompatSynthesizer(model, url or default, max_tokens=max_tokens, system=system, timeout=300.0)
@@ -168,12 +198,15 @@ def main():
                     help="f1 (token F1 + contains-gold, no LLM judge) | claude:MODEL | ollama:MODEL")
     ap.add_argument("--cache", default="qa_cache.jsonl")
     ap.add_argument("--no-rerank", action="store_true")
+    ap.add_argument("--ollama-opt", action="append", default=[], metavar="K=V",
+                    help="Ollama option, e.g. num_gpu=0 to run on CPU only (repeatable)")
     a = ap.parse_args()
     load_dotenv()
     data = json.load(open(a.data))
     emb = CachedEmbedder(from_spec(a.embedder))
     rr = None if a.no_rerank else CachedReranker(OnnxCrossEncoder())
-    answer = make_llm(a.llm, SHORT_SYSTEM, 60)
+    opts = {k: int(v) if v.lstrip('-').isdigit() else v for k, v in (o.split('=', 1) for o in a.ollama_opt)}
+    answer = make_llm(a.llm, SHORT_SYSTEM, 60, opts)
     judge_llm = None if a.judge == "f1" else make_llm(a.judge, JUDGE_SYSTEM, 5)
     systems = SYSTEMS if rr else ("chunks", "span2", "span3")
     t0 = time.perf_counter()
